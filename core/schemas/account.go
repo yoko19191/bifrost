@@ -314,15 +314,438 @@ type BasetenAliasCfg struct {
 
 // AliasConfig is the rich value type held by KeyAliases. It carries everything
 // needed to call a provider for an aliased model: the wire model identifier
+// EffortModels maps a single user-facing model alias onto effort-tiered upstream
+// model IDs (for example <base>-low, <base>-medium, <base>-high).
+type EffortModels struct {
+	Low     string `json:"low,omitempty"`
+	Medium  string `json:"medium,omitempty"`
+	High    string `json:"high,omitempty"`
+	Default string `json:"default,omitempty"` // "low", "medium", or "high"
+}
+
+// IsEmpty reports whether no effort-tier models are configured.
+func (em *EffortModels) IsEmpty() bool {
+	if em == nil {
+		return true
+	}
+	return strings.TrimSpace(em.Low) == "" &&
+		strings.TrimSpace(em.Medium) == "" &&
+		strings.TrimSpace(em.High) == "" &&
+		strings.TrimSpace(em.Default) == ""
+}
+
+// Clone returns a deep copy of EffortModels, or nil when empty.
+func (em *EffortModels) Clone() *EffortModels {
+	if em.IsEmpty() {
+		return nil
+	}
+	def := strings.TrimSpace(em.Default)
+	switch strings.ToLower(def) {
+	case "low", "medium", "high":
+		def = strings.ToLower(def)
+	}
+	return &EffortModels{
+		Low:     strings.TrimSpace(em.Low),
+		Medium:  strings.TrimSpace(em.Medium),
+		High:    strings.TrimSpace(em.High),
+		Default: def,
+	}
+}
+
+// Normalize validates and normalizes an EffortModels configuration.
+// Default may be either a tier name ("low", "medium", "high") or an explicit upstream model ID.
+func (em *EffortModels) Normalize() (*EffortModels, error) {
+	if em == nil {
+		return nil, nil
+	}
+	low := strings.TrimSpace(em.Low)
+	medium := strings.TrimSpace(em.Medium)
+	high := strings.TrimSpace(em.High)
+	rawDefault := strings.TrimSpace(em.Default)
+
+	if low == "" && medium == "" && high == "" && rawDefault == "" {
+		return nil, nil
+	}
+	switch strings.ToLower(rawDefault) {
+	case "low", "medium", "high":
+		rawDefault = strings.ToLower(rawDefault)
+	}
+
+	normalized := &EffortModels{
+		Low:     low,
+		Medium:  medium,
+		High:    high,
+		Default: rawDefault,
+	}
+	if normalized.Default == "" {
+		for _, candidate := range []string{"medium", "high", "low"} {
+			if normalized.ModelForLevel(candidate) != "" {
+				normalized.Default = candidate
+				break
+			}
+		}
+	}
+	return normalized, nil
+}
+
+// ModelForLevel returns the trimmed model ID for "low", "medium", or "high".
+func (em *EffortModels) ModelForLevel(level string) string {
+	if em == nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "low":
+		return strings.TrimSpace(em.Low)
+	case "medium":
+		return strings.TrimSpace(em.Medium)
+	case "high":
+		return strings.TrimSpace(em.High)
+	default:
+		return ""
+	}
+}
+
+// DefaultModel returns the default tier's upstream model ID.
+func (em *EffortModels) DefaultModel() string {
+	if em.IsEmpty() {
+		return ""
+	}
+	if m := em.ModelForLevel(em.Default); m != "" {
+		return m
+	}
+	if d := strings.TrimSpace(em.Default); d != "" && !strings.EqualFold(d, "low") && !strings.EqualFold(d, "medium") && !strings.EqualFold(d, "high") {
+		return d
+	}
+	for _, candidate := range []string{"medium", "high", "low"} {
+		if m := em.ModelForLevel(candidate); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// Models returns the deduplicated non-empty upstream model IDs in low, medium, high, default order.
+func (em *EffortModels) Models() []string {
+	if em.IsEmpty() {
+		return nil
+	}
+	result := make([]string, 0, 4)
+	candidates := []string{
+		em.ModelForLevel("low"),
+		em.ModelForLevel("medium"),
+		em.ModelForLevel("high"),
+		em.DefaultModel(),
+	}
+	for _, model := range candidates {
+		if model == "" {
+			continue
+		}
+		dup := false
+		for _, existing := range result {
+			if existing == model {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			result = append(result, model)
+		}
+	}
+	return result
+}
+
+// Resolve selects the concrete upstream model ID and effort tier for a request's reasoning parameters.
+func (em *EffortModels) Resolve(effort string, maxTokens *int) (targetModel string, level string, ok bool) {
+	if em.IsEmpty() {
+		return "", "", false
+	}
+	if strings.TrimSpace(effort) == "" && maxTokens == nil {
+		if defModel := em.DefaultModel(); defModel != "" {
+			lvl := strings.ToLower(strings.TrimSpace(em.Default))
+			if lvl != "low" && lvl != "medium" && lvl != "high" {
+				lvl = "medium"
+			}
+			return defModel, lvl, true
+		}
+	}
+	desired := em.desiredLevel(effort, maxTokens)
+	if model := em.ModelForLevel(desired); model != "" {
+		return model, desired, true
+	}
+	if defModel := em.DefaultModel(); defModel != "" {
+		return defModel, desired, true
+	}
+	for _, fallback := range []string{"medium", "high", "low"} {
+		if model := em.ModelForLevel(fallback); model != "" {
+			return model, fallback, true
+		}
+	}
+	return "", "", false
+}
+
+func (em *EffortModels) desiredLevel(effort string, maxTokens *int) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "none", "minimal", "low":
+		return "low"
+	case "medium", "auto":
+		return "medium"
+	case "high", "xhigh", "max":
+		return "high"
+	}
+	if maxTokens != nil {
+		budget := *maxTokens
+		switch {
+		case budget <= 0:
+			// fall through to default
+		case budget <= 2048:
+			return "low"
+		case budget <= 8192:
+			return "medium"
+		default:
+			return "high"
+		}
+	}
+	if em.ModelForLevel(em.Default) != "" {
+		return strings.ToLower(strings.TrimSpace(em.Default))
+	}
+	for _, candidate := range []string{"medium", "high", "low"} {
+		if em.ModelForLevel(candidate) != "" {
+			return candidate
+		}
+	}
+	return "medium"
+}
+
+// SplitModelEffortSuffix checks whether model ends with a recognized reasoning
+// effort suffix (-minimal, -low, -medium, -high, -xhigh, -max) and splits it
+// into the base model name and canonical effort level.
+func SplitModelEffortSuffix(model string) (baseModel string, effort string, ok bool) {
+	idx := strings.LastIndexByte(model, '-')
+	if idx <= 0 || idx == len(model)-1 {
+		return "", "", false
+	}
+	suffix := model[idx+1:]
+	switch {
+	case strings.EqualFold(suffix, "minimal"):
+		return model[:idx], "minimal", true
+	case strings.EqualFold(suffix, "low"):
+		return model[:idx], "low", true
+	case strings.EqualFold(suffix, "medium"):
+		return model[:idx], "medium", true
+	case strings.EqualFold(suffix, "high"):
+		return model[:idx], "high", true
+	case strings.EqualFold(suffix, "xhigh"):
+		return model[:idx], "xhigh", true
+	case strings.EqualFold(suffix, "max"):
+		return model[:idx], "max", true
+	default:
+		return "", "", false
+	}
+}
+
+// DetectedEffortFamily describes an automatically synthesized base model and its
+// effort-tiered upstream model mapping discovered from a raw model list.
+type DetectedEffortFamily struct {
+	BaseID       string        `json:"base_id"`
+	ModelID      string        `json:"model_id"`
+	EffortModels *EffortModels `json:"effort_models"`
+	SourceIDs    []string      `json:"source_ids"`
+}
+
+// DetectEffortFamilies inspects a list of upstream model IDs and automatically detects
+// effort-fusible model families:
+//   - Multi-tier families: <base>-low, <base>-medium, <base>-high (plus optional <base>-tiered)
+//   - Single-tier upstream-only variants: e.g. gpt-oss-120b-medium where <base> does not exist standalone
+//   - Thinking-suffixed variants: <base>-thinking (e.g. claude-opus-4-6-thinking -> claude-opus-4-6)
+func DetectEffortFamilies(modelIDs []string) []DetectedEffortFamily {
+	type rawFamily struct {
+		low       string
+		medium    string
+		high      string
+		thinking  string
+		sourceIDs []string
+	}
+	addSource := func(f *rawFamily, id string) {
+		for _, existing := range f.sourceIDs {
+			if strings.EqualFold(existing, id) {
+				return
+			}
+		}
+		f.sourceIDs = append(f.sourceIDs, id)
+	}
+
+	cleaned := make([]string, 0, len(modelIDs))
+	exactByLower := make(map[string]string, len(modelIDs))
+	for _, raw := range modelIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" || id == "*" || IsRegexEntry(id) {
+			continue
+		}
+		if slashIdx := strings.IndexByte(id, '/'); slashIdx > 0 && slashIdx < len(id)-1 {
+			// Preserve bare model IDs for OAuth channel catalogs ("antigravity/claude-..." -> "claude-...")
+			prefix := strings.ToLower(id[:slashIdx])
+			if prefix == "antigravity" || prefix == "codex" || prefix == "claude" || prefix == "grok" {
+				id = id[slashIdx+1:]
+			}
+		}
+		lower := strings.ToLower(id)
+		if _, exists := exactByLower[lower]; !exists {
+			exactByLower[lower] = id
+			cleaned = append(cleaned, id)
+		}
+	}
+
+	families := make(map[string]*rawFamily)
+	baseOrder := make([]string, 0)
+	getOrCreate := func(baseID string) *rawFamily {
+		lowerBase := strings.ToLower(baseID)
+		if fam, ok := families[lowerBase]; ok {
+			return fam
+		}
+		fam := &rawFamily{}
+		families[lowerBase] = fam
+		baseOrder = append(baseOrder, baseID)
+		return fam
+	}
+
+	for _, id := range cleaned {
+		idx := strings.LastIndexByte(id, '-')
+		if idx <= 0 || idx == len(id)-1 {
+			continue
+		}
+		baseID := id[:idx]
+		suffix := strings.ToLower(id[idx+1:])
+		switch suffix {
+		case "low":
+			fam := getOrCreate(baseID)
+			fam.low = id
+			addSource(fam, id)
+			if tiered, ok := exactByLower[strings.ToLower(baseID)+"-tiered"]; ok {
+				addSource(fam, tiered)
+			}
+		case "medium":
+			fam := getOrCreate(baseID)
+			fam.medium = id
+			addSource(fam, id)
+			if tiered, ok := exactByLower[strings.ToLower(baseID)+"-tiered"]; ok {
+				addSource(fam, tiered)
+			}
+		case "high":
+			fam := getOrCreate(baseID)
+			fam.high = id
+			addSource(fam, id)
+			if tiered, ok := exactByLower[strings.ToLower(baseID)+"-tiered"]; ok {
+				addSource(fam, tiered)
+			}
+		case "thinking":
+			fam := getOrCreate(baseID)
+			fam.thinking = id
+			addSource(fam, id)
+		}
+	}
+
+	firstNonEmpty := func(vals ...string) string {
+		for _, v := range vals {
+			if strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
+	}
+
+	results := make([]DetectedEffortFamily, 0, len(baseOrder))
+	for _, baseID := range baseOrder {
+		fam := families[strings.ToLower(baseID)]
+		if fam == nil {
+			continue
+		}
+		standaloneBase := exactByLower[strings.ToLower(baseID)]
+		tierCount := 0
+		if fam.low != "" {
+			tierCount++
+		}
+		if fam.medium != "" {
+			tierCount++
+		}
+		if fam.high != "" {
+			tierCount++
+		}
+
+		// Require either:
+		// 1. At least 2 explicit tiers (<base>-low/medium/high), OR
+		// 2. A <base>-thinking model, OR
+		// 3. A single tier (<base>-low|medium|high) when standalone <base> does not exist (e.g. gpt-oss-120b-medium).
+		if tierCount == 0 && fam.thinking == "" {
+			continue
+		}
+		if tierCount == 1 && fam.thinking == "" && standaloneBase != "" {
+			continue
+		}
+
+		low := firstNonEmpty(fam.low, standaloneBase, fam.medium, fam.high, fam.thinking)
+		medium := firstNonEmpty(fam.medium, fam.thinking, fam.high, fam.low, standaloneBase)
+		high := firstNonEmpty(fam.high, fam.thinking, fam.medium, fam.low, standaloneBase)
+		defaultTier := "medium"
+		if fam.medium != "" || fam.thinking != "" {
+			defaultTier = "medium"
+		} else if fam.high != "" {
+			defaultTier = "high"
+		} else if fam.low != "" {
+			defaultTier = "low"
+		}
+
+		em, err := (&EffortModels{
+			Low:     low,
+			Medium:  medium,
+			High:    high,
+			Default: defaultTier,
+		}).Normalize()
+		if err != nil || em.IsEmpty() {
+			continue
+		}
+		canonicalBase := baseID
+		if standaloneBase != "" {
+			canonicalBase = standaloneBase
+		}
+		results = append(results, DetectedEffortFamily{
+			BaseID:       canonicalBase,
+			ModelID:      em.DefaultModel(),
+			EffortModels: em,
+			SourceIDs:    fam.sourceIDs,
+		})
+	}
+	slices.SortFunc(results, func(a, b DetectedEffortFamily) int {
+		return strings.Compare(strings.ToLower(a.BaseID), strings.ToLower(b.BaseID))
+	})
+	return results
+}
+
+// BuildAutoEffortAliases converts detected effort families from modelIDs into a KeyAliases map.
+func BuildAutoEffortAliases(modelIDs []string) KeyAliases {
+	families := DetectEffortFamilies(modelIDs)
+	if len(families) == 0 {
+		return nil
+	}
+	out := make(KeyAliases, len(families))
+	for _, fam := range families {
+		out[fam.BaseID] = AliasConfig{
+			ModelID:      fam.ModelID,
+			EffortModels: fam.EffortModels,
+		}
+	}
+	return out
+}
+
 // (ModelID), the canonical model name used for pricing/logging (ModelName), the
 // family used for provider routing decisions (ModelFamily), and optional
 // provider-specific overrides that override the key-level defaults.
 type AliasConfig struct {
-	ModelID     string       `json:"model_id"`               // wire model identifier sent to the provider
-	ModelName   *string      `json:"model_name,omitempty"`   // canonical model name used for pricing, logging, and 2nd-tier family routing
-	ModelFamily *ModelFamily `json:"model_family,omitempty"` // 1st-tier family routing enum
-	Description string       `json:"description,omitempty"`  // description of the alias for users to understand its purpose (not used by bifrost)
-	Region      *SecretVar   `json:"region,omitempty"`
+	ModelID      string        `json:"model_id"`                // wire model identifier sent to the provider
+	EffortModels *EffortModels `json:"effort_models,omitempty"` // optional effort-tiered upstream model mapping (low/medium/high)
+	ModelName    *string       `json:"model_name,omitempty"`    // canonical model name used for pricing, logging, and 2nd-tier family routing
+	ModelFamily  *ModelFamily  `json:"model_family,omitempty"`  // 1st-tier family routing enum
+	Description  string        `json:"description,omitempty"`   // description of the alias for users to understand its purpose (not used by bifrost)
+	Region       *SecretVar    `json:"region,omitempty"`
 	// ProjectID is a per-alias project override shared across providers (like Region).
 	// Vertex uses it as the GCP project; Bedrock and Bedrock Mantle use it as the
 	// AWS project sent via the OpenAI-Project / anthropic-workspace-id header. Kept
@@ -340,9 +763,29 @@ type AliasConfig struct {
 	*BasetenAliasCfg
 }
 
+// EffectiveModelID returns ModelID when non-empty, or the default model from EffortModels.
+func (ac AliasConfig) EffectiveModelID() string {
+	if m := strings.TrimSpace(ac.ModelID); m != "" {
+		return m
+	}
+	return ac.EffortModels.DefaultModel()
+}
+
+// ResolveModelID returns the target upstream model ID for the given reasoning effort and maxTokens.
+// When EffortModels is configured, it selects the corresponding tier model; otherwise it returns EffectiveModelID().
+func (ac AliasConfig) ResolveModelID(effort string, maxTokens *int) string {
+	if !ac.EffortModels.IsEmpty() {
+		if target, _, ok := ac.EffortModels.Resolve(effort, maxTokens); ok {
+			return target
+		}
+	}
+	return ac.EffectiveModelID()
+}
+
 // Redacted copies the alias and its secret-bearing sub-configs, masking resolved
 // env/vault values while preserving literal identifiers and secret references.
 func (ac AliasConfig) Redacted() AliasConfig {
+	ac.EffortModels = ac.EffortModels.Clone()
 	ac.Region = ac.Region.RedactedIfSecret()
 	ac.ProjectID = ac.ProjectID.RedactedIfSecret()
 	if ac.AzureAliasCfg != nil {
@@ -379,6 +822,7 @@ func (ac AliasConfig) Redacted() AliasConfig {
 // shape so older consumers that expect map[string]string keep working.
 func (ac AliasConfig) isLegacyShape() bool {
 	return ac.ModelID != "" &&
+		ac.EffortModels.IsEmpty() &&
 		ac.ModelName == nil &&
 		ac.ModelFamily == nil &&
 		ac.Description == "" &&
@@ -405,6 +849,9 @@ func (ac AliasConfig) MarshalJSON() ([]byte, error) {
 	// config hash). Value receiver: this mutates only the local copy, not the caller's.
 	if ac.ProjectID == nil && ac.VertexAliasCfg != nil && ac.VertexAliasCfg.ProjectID != nil {
 		ac.ProjectID = ac.VertexAliasCfg.ProjectID
+	}
+	if !ac.EffortModels.IsEmpty() && strings.TrimSpace(ac.ModelID) == "" {
+		ac.ModelID = ac.EffortModels.DefaultModel()
 	}
 	if ac.isLegacyShape() {
 		return Marshal(ac.ModelID)
@@ -440,13 +887,20 @@ func (ka KeyAliases) Validate(providerKey ModelProvider) error {
 		if strings.TrimSpace(from) == "" {
 			return fmt.Errorf("alias source cannot be empty")
 		}
-		if strings.TrimSpace(ac.ModelID) == "" {
+		if ac.EffortModels != nil {
+			normalizedEffort, err := ac.EffortModels.Normalize()
+			if err != nil {
+				return fmt.Errorf("alias %q: %w", from, err)
+			}
+			ac.EffortModels = normalizedEffort
+		}
+		if strings.TrimSpace(ac.EffectiveModelID()) == "" {
 			return fmt.Errorf("alias %q: model_id cannot be empty", from)
 		}
 		if strings.TrimSpace(from) != from {
 			return fmt.Errorf("alias source %q cannot have leading or trailing whitespace", from)
 		}
-		if strings.TrimSpace(ac.ModelID) != ac.ModelID {
+		if ac.ModelID != "" && strings.TrimSpace(ac.ModelID) != ac.ModelID {
 			return fmt.Errorf("alias %q: model_id cannot have leading or trailing whitespace", from)
 		}
 		if ac.ModelName != nil && strings.TrimSpace(*ac.ModelName) != *ac.ModelName {
@@ -508,7 +962,12 @@ func (ka KeyAliases) Validate(providerKey ModelProvider) error {
 // (ModelName, ModelFamily, provider overrides), use ResolveConfig.
 func (ka KeyAliases) Resolve(model string) string {
 	if ac := ka.ResolveConfig(model); ac != nil {
-		return ac.ModelID
+		return ac.EffectiveModelID()
+	}
+	if baseModel, suffixEffort, hasSuffix := SplitModelEffortSuffix(model); hasSuffix {
+		if ac := ka.ResolveConfig(baseModel); ac != nil {
+			return ac.ResolveModelID(suffixEffort, nil)
+		}
 	}
 	return model
 }
@@ -801,6 +1260,9 @@ func (ka KeyAliases) ResolveConfig(model string) *AliasConfig {
 	}
 	if v, ok := ka[model]; ok {
 		ac := v
+		if strings.TrimSpace(ac.ModelID) == "" && !ac.EffortModels.IsEmpty() {
+			ac.ModelID = ac.EffortModels.DefaultModel()
+		}
 		return &ac
 	}
 	// One pass: a case-insensitive exact name wins outright, otherwise the first-ordered matching pattern.
@@ -809,6 +1271,9 @@ func (ka KeyAliases) ResolveConfig(model string) *AliasConfig {
 		if !IsRegexEntry(k) {
 			if strings.EqualFold(k, model) {
 				ac := ka[k]
+				if strings.TrimSpace(ac.ModelID) == "" && !ac.EffortModels.IsEmpty() {
+					ac.ModelID = ac.EffortModels.DefaultModel()
+				}
 				return &ac
 			}
 			continue
@@ -905,6 +1370,16 @@ func (ka *KeyAliases) UnmarshalJSON(data []byte) error {
 			var ac AliasConfig
 			if err := sonic.Unmarshal(entry, &ac); err != nil {
 				return fmt.Errorf("alias %q: %w", k, err)
+			}
+			if ac.EffortModels != nil {
+				normalizedEffort, err := ac.EffortModels.Normalize()
+				if err != nil {
+					return fmt.Errorf("alias %q: %w", k, err)
+				}
+				ac.EffortModels = normalizedEffort
+				if strings.TrimSpace(ac.ModelID) == "" && !ac.EffortModels.IsEmpty() {
+					ac.ModelID = ac.EffortModels.DefaultModel()
+				}
 			}
 			result[k] = ac
 		default:

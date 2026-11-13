@@ -240,4 +240,8 @@ require (
 	gorm.io/driver/postgres v1.6.0 // indirect
 )
 
-replace github.com/mark3labs/mcp-go => github.com/maximhq/mcp-go v0.0.0-20261102181017-b7da3bc145a1
+replace (
+	github.com/MoeForge/moego v0.1.0-alpha.1 => github.com/router-for-me/moego v0.1.2
+	github.com/mark3labs/mcp-go => github.com/maximhq/mcp-go v0.0.0-20261102181017-b7da3bc145a1
+	github.com/router-for-me/CLIProxyAPI/v8/gptload-embedded => ../third_party/cpaembedded
+)

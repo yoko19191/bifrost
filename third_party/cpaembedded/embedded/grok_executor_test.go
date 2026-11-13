@@ -1,0 +1,402 @@
+package embedded
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	internalexecutor "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	"github.com/tidwall/gjson"
+)
+
+func TestGrokExecutorConvertsFourProtocolsUnaryAndStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" || r.Header.Get("Authorization") != "Bearer access-secret" {
+			t.Fatalf("request = %s %s, auth %q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("x-grok-client-version") != GrokClientVersion ||
+			r.Header.Get("User-Agent") != "xai-grok-workspace/"+GrokClientVersion {
+			t.Fatalf("execution identity = %q / %q", r.Header.Get("x-grok-client-version"), r.Header.Get("User-Agent"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"grok-4.3","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	cfg := &internalconfig.Config{}
+	executor := &grokHTTPExecutor{cfg: cfg, inner: internalexecutor.NewXAIExecutor(cfg), baseURL: server.URL}
+	credential := testGrokExecutionCredential()
+	for _, test := range []struct {
+		name    string
+		format  string
+		payload string
+		usage   string
+	}{
+		{name: "responses", format: "openai-response", payload: `{"model":"grok-4.3","input":"hi"}`, usage: "usage.input_tokens"},
+		{name: "chat", format: "openai", payload: `{"model":"grok-4.3","messages":[{"role":"user","content":"hi"}]}`, usage: "usage.prompt_tokens"},
+		{name: "anthropic", format: "claude", payload: `{"model":"grok-4.3","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`, usage: "usage.input_tokens"},
+		{name: "gemini", format: "gemini", payload: `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, usage: "usageMetadata.promptTokenCount"},
+	} {
+		t.Run(test.name+" unary", func(t *testing.T) {
+			response, err := executor.ExecuteCanonical(t.Context(), "credential-1", credential, ExecuteRequest{
+				AttemptID: "attempt-1", Model: "grok-4.3", Format: test.format,
+				Payload: []byte(test.payload), OriginalRequest: []byte(test.payload), ContinuityKey: "tenant-scope",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(response.Payload, []byte("ok")) || gjson.GetBytes(response.Payload, test.usage).Int() != 2 {
+				t.Fatalf("response = %s", response.Payload)
+			}
+		})
+		t.Run(test.name+" stream", func(t *testing.T) {
+			response, err := executor.ExecuteStreamCanonical(t.Context(), "credential-1", credential, ExecuteRequest{
+				AttemptID: "attempt-1", Model: "grok-4.3", Format: test.format,
+				Payload: []byte(test.payload), OriginalRequest: []byte(test.payload), ContinuityKey: "tenant-scope",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output []byte
+			for chunk := range response.Chunks {
+				if chunk.Err != nil {
+					t.Fatal(chunk.Err)
+				}
+				output = append(output, chunk.Payload...)
+			}
+			if len(output) == 0 {
+				t.Fatal("stream returned no translated chunks")
+			}
+		})
+	}
+}
+
+func TestGrokExecutorUsesHeaderSafeConversationIDForOpaqueContinuity(t *testing.T) {
+	type captured struct {
+		conversationID string
+		cacheKey       string
+	}
+	var requests []captured
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		requests = append(requests, captured{
+			conversationID: r.Header.Get("x-grok-conv-id"),
+			cacheKey:       gjson.GetBytes(body, "prompt_cache_key").String(),
+		})
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"grok-4.6","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := testGrokHTTPExecutor(server.URL)
+	send := func(continuity, attempt, input, format string) captured {
+		t.Helper()
+		before := len(requests)
+		var payload []byte
+		switch format {
+		case "openai":
+			payload = []byte(fmt.Sprintf(`{"model":"grok-4.6","messages":[{"role":"user","content":%q}]}`, input))
+		default:
+			payload = []byte(fmt.Sprintf(`{"model":"grok-4.6","input":%q}`, input))
+		}
+		_, err := executor.ExecuteCanonical(t.Context(), "credential-1", testGrokExecutionCredential(), ExecuteRequest{
+			AttemptID: attempt, Model: "grok-4.6", Format: format,
+			Payload: payload, OriginalRequest: append([]byte(nil), payload...),
+			ContinuityKey: continuity,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(requests) != before+1 {
+			t.Fatalf("upstream requests = %d, want %d", len(requests), before+1)
+		}
+		got := requests[len(requests)-1]
+		if len(got.conversationID) != 36 || strings.ContainsAny(got.conversationID, "\r\n\x00") || got.cacheKey != got.conversationID {
+			t.Fatalf("upstream cache = %#v", got)
+		}
+		return got
+	}
+
+	send("tenant\x00credential-1\x00grok-4.6", "attempt-1", "hi", "openai-response")
+	first := send("same-scope", "attempt-1", "hello", "openai-response")
+	second := send("same-scope", "attempt-2", "hello\nfollow up", "openai-response")
+	if first.cacheKey != second.cacheKey {
+		t.Fatalf("same continuity keys = %q %q", first.cacheKey, second.cacheKey)
+	}
+	other := send("other-scope", "attempt-3", "hello\nfollow up", "openai-response")
+	if other.cacheKey == first.cacheKey {
+		t.Fatalf("different continuity reused %q", other.cacheKey)
+	}
+	chat := send("same-scope", "attempt-4", "hello", "openai")
+	if chat.cacheKey != first.cacheKey {
+		t.Fatalf("chat prompt_cache_key = %q, responses = %q", chat.cacheKey, first.cacheKey)
+	}
+	emptyA := send("", "attempt-a", "hi", "openai-response")
+	emptyAgain := send("", "attempt-a", "hi again", "openai-response")
+	emptyB := send("", "attempt-b", "hi", "openai-response")
+	if emptyA.cacheKey != emptyAgain.cacheKey || emptyA.cacheKey == emptyB.cacheKey || emptyA.cacheKey == first.cacheKey {
+		t.Fatalf("attempt-scoped keys = %q %q %q", emptyA.cacheKey, emptyAgain.cacheKey, emptyB.cacheKey)
+	}
+}
+
+func TestGrokExecutorCountsTokensLocally(t *testing.T) {
+	executor := NewGrokHTTPExecutor()
+	for _, test := range []struct {
+		format  string
+		payload string
+		path    string
+	}{
+		{format: "openai-response", payload: `{"model":"grok-4.3","input":"hello world"}`, path: "input_tokens"},
+		{format: "claude", payload: `{"model":"grok-4.3","messages":[{"role":"user","content":"hello world"}]}`, path: "input_tokens"},
+		{format: "gemini", payload: `{"contents":[{"role":"user","parts":[{"text":"hello world"}]}]}`, path: "totalTokens"},
+	} {
+		response, err := executor.CountTokensCanonical(context.Background(), ExecuteRequest{
+			Model: "grok-4.3", Format: test.format, Payload: []byte(test.payload), OriginalRequest: []byte(test.payload),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gjson.GetBytes(response.Payload, test.path).Int() <= 0 || strings.Contains(string(response.Payload), "access-secret") {
+			t.Fatalf("count response = %s", response.Payload)
+		}
+		if test.format == "openai-response" && gjson.GetBytes(response.Payload, "object").String() != "response.input_tokens" {
+			t.Fatalf("Responses token count = %s", response.Payload)
+		}
+	}
+}
+
+func TestGrokExecutorPreservesRichChatRequestAndToolResponse(t *testing.T) {
+	var upstreamBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upstreamBody = append([]byte(nil), body...)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_tool","object":"response","status":"completed","model":"grok-4.3","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"considering"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}","status":"completed"}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	payload := []byte(`{
+		"model":"grok-4.3","reasoning_effort":"high",
+		"messages":[
+			{"role":"system","content":"follow the rule"},
+			{"role":"user","content":[
+				{"type":"text","text":"inspect"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+			]}
+		],
+		"tools":[{"type":"function","function":{"name":"lookup","description":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}],
+		"tool_choice":"auto"
+	}`)
+	response, err := testGrokHTTPExecutor(server.URL).ExecuteCanonical(
+		t.Context(), "credential-1", testGrokExecutionCredential(), ExecuteRequest{
+			AttemptID: "attempt-1", Model: "grok-4.3", Format: "openai",
+			Payload: payload, OriginalRequest: payload, ContinuityKey: "tenant-scope",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(upstreamBody), "follow the rule") ||
+		gjson.GetBytes(upstreamBody, "tools.0.name").String() != "lookup" ||
+		gjson.GetBytes(upstreamBody, "reasoning.effort").String() != "high" ||
+		!strings.Contains(string(upstreamBody), "data:image/png;base64,AAAA") {
+		t.Fatalf("rich upstream request = %s", upstreamBody)
+	}
+	if gjson.GetBytes(response.Payload, "choices.0.message.tool_calls.0.function.name").String() != "lookup" ||
+		gjson.GetBytes(response.Payload, "choices.0.finish_reason").String() != "tool_calls" ||
+		gjson.GetBytes(response.Payload, "usage.prompt_tokens").Int() != 5 ||
+		gjson.GetBytes(response.Payload, "usage.completion_tokens").Int() != 3 ||
+		response.AppliedReasoningEffort != "high" {
+		t.Fatalf("rich downstream response = %s, applied=%q", response.Payload, response.AppliedReasoningEffort)
+	}
+}
+
+func TestGrokExecutionOnlyBridgeUsesOneDispatchAndRejectsRedirects(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Location", "/redirected")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	executor := testGrokHTTPExecutor(server.URL)
+	request := testGrokRequest()
+	request.ProxyURL = "direct"
+	_, err := executor.ExecuteCanonical(t.Context(), "credential-1", testGrokExecutionCredential(), request)
+	if !errors.Is(err, ErrRedirectNotAllowed) || calls.Load() != 1 {
+		t.Fatalf("redirect result = %v, calls = %d", err, calls.Load())
+	}
+}
+
+func TestGrokExecutionOnlyBridgeDoesNotRetryOrRefreshPreparedCredential(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"code":"subscription:free-usage-exhausted","error":"exhausted"}`))
+	}))
+	defer server.Close()
+
+	credential := testGrokExecutionCredential()
+	credential.Expire = time.Now().UTC().Add(time.Second).Format(time.RFC3339)
+	_, err := testGrokHTTPExecutor(server.URL).ExecuteCanonical(t.Context(), "credential-1", credential, testGrokRequest())
+	var upstream *GrokExecutionError
+	if !errors.As(err, &upstream) || upstream.StatusCode() != http.StatusTooManyRequests ||
+		upstream.ErrorCode() != "subscription:free-usage-exhausted" || calls.Load() != 1 {
+		t.Fatalf("execution result = %#v, calls = %d", err, calls.Load())
+	}
+	if retry := upstream.RetryAfter(); retry == nil || *retry != 24*time.Hour {
+		t.Fatalf("RetryAfter = %v", retry)
+	}
+}
+
+func TestGrokExecutionOnlyBridgeMapsBadCredentialsToUnauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":"unauthenticated:bad-credentials","error":"invalid OAuth access token"}`))
+	}))
+	defer server.Close()
+
+	_, err := testGrokHTTPExecutor(server.URL).ExecuteCanonical(
+		t.Context(), "credential-1", testGrokExecutionCredential(), testGrokRequest(),
+	)
+	var upstream *GrokExecutionError
+	if !errors.As(err, &upstream) || upstream.StatusCode() != http.StatusUnauthorized ||
+		upstream.ErrorCode() != "unauthenticated:bad-credentials" {
+		t.Fatalf("bad credentials error = %#v", err)
+	}
+}
+
+func TestGrokExecutionRequestRemovesCallerContinuity(t *testing.T) {
+	request := ExecuteRequest{
+		AttemptID: "attempt-1", ContinuityKey: "private-scope", Format: "openai-response",
+		Payload:         []byte(`{"input":"keep","session_id":"caller","prompt_cache_key":"caller-cache","metadata":{"sessionId":"nested"}}`),
+		OriginalRequest: []byte(`{"input":"keep","sessionId":"caller","prompt_cache_key":"caller-cache","metadata":{"session_id":"nested"}}`),
+		Headers:         http.Header{"Session-Id": {"caller"}, "X-Grok-Conv-Id": {"caller-conversation"}},
+	}
+	prepared := prepareGrokExecutionRequest(request)
+	for _, raw := range [][]byte{prepared.Payload, prepared.OriginalRequest} {
+		if !json.Valid(raw) || strings.Contains(string(raw), "caller") || !strings.Contains(string(raw), "keep") {
+			t.Fatalf("prepared payload = %s", raw)
+		}
+	}
+	if prepared.Headers.Get("Session-Id") != "" || prepared.Headers.Get("X-Grok-Conv-Id") != "" ||
+		prepared.ContinuityKey != "private-scope" {
+		t.Fatalf("prepared request = %#v", prepared)
+	}
+
+	upstream := scopeGrokExecutionRequest(request, "https://cli-chat-proxy.grok.com")
+	want := grokConversationID(upstream.ContinuityKey)
+	if len(want) != 36 || strings.Contains(want, "caller") {
+		t.Fatalf("gateway cache key = %q", want)
+	}
+	for _, raw := range [][]byte{upstream.Payload, upstream.OriginalRequest} {
+		if !json.Valid(raw) || strings.Contains(string(raw), "caller") || !strings.Contains(string(raw), "keep") ||
+			gjson.GetBytes(raw, "prompt_cache_key").String() != want {
+			t.Fatalf("upstream payload = %s", raw)
+		}
+	}
+	if upstream.Headers.Get("Session-Id") != "" || upstream.Headers.Get("X-Grok-Conv-Id") != "" {
+		t.Fatalf("upstream headers = %#v", upstream.Headers)
+	}
+}
+
+func TestGrokExecutionOnlyBridgePropagatesCancellation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer func() {
+		close(release)
+		server.Close()
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := testGrokHTTPExecutor(server.URL).ExecuteCanonical(ctx, "credential-1", testGrokExecutionCredential(), testGrokRequest())
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled Grok request did not return")
+	}
+}
+
+type grokWrappedStatusError struct {
+	status int
+	body   string
+}
+
+func (err grokWrappedStatusError) Error() string   { return err.body }
+func (err grokWrappedStatusError) StatusCode() int { return err.status }
+func (err grokWrappedStatusError) RetryAfter() *time.Duration {
+	value := 3 * time.Second
+	return &value
+}
+
+func TestNormalizeGrokExecutionErrorPreservesWrappedMetadata(t *testing.T) {
+	err := normalizeGrokExecutionError(fmt.Errorf("execute Grok request: %w", grokWrappedStatusError{
+		status: http.StatusTooManyRequests,
+		body:   `{"code":"subscription:free-usage-exhausted"}`,
+	}))
+	var normalized *GrokExecutionError
+	if !errors.As(err, &normalized) || normalized.StatusCode() != http.StatusTooManyRequests ||
+		normalized.ErrorCode() != "subscription:free-usage-exhausted" || normalized.RetryAfter() == nil ||
+		*normalized.RetryAfter() != 3*time.Second {
+		t.Fatalf("normalized error = %#v", err)
+	}
+}
+
+func testGrokHTTPExecutor(baseURL string) *grokHTTPExecutor {
+	cfg := &internalconfig.Config{}
+	return &grokHTTPExecutor{cfg: cfg, inner: internalexecutor.NewXAIExecutor(cfg), baseURL: baseURL}
+}
+
+func testGrokRequest() ExecuteRequest {
+	payload := []byte(`{"model":"grok-4.3","input":"hello"}`)
+	return ExecuteRequest{
+		AttemptID: "attempt-1", Model: "grok-4.3", Format: "openai-response",
+		Payload: payload, OriginalRequest: append([]byte(nil), payload...), ContinuityKey: "tenant-scope",
+	}
+}
+
+func testGrokExecutionCredential() GrokCredential {
+	return GrokCredential{
+		Type: ProviderGrok, AccessToken: "access-secret", RefreshToken: "refresh-secret",
+		TokenType: "Bearer", AccountID: "account-1", Email: "owner@example.com",
+		TokenEndpoint: "https://auth.x.ai/oauth/token",
+		Expire:        time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+	}
+}

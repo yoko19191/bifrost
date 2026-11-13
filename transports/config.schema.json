@@ -774,6 +774,18 @@
         },
         "github-copilot": {
           "$ref": "#/$defs/provider_with_github_copilot_config"
+        },
+        "antigravity": {
+          "$ref": "#/$defs/provider"
+        },
+        "codex": {
+          "$ref": "#/$defs/provider"
+        },
+        "claude": {
+          "$ref": "#/$defs/provider"
+        },
+        "grok": {
+          "$ref": "#/$defs/provider"
         }
       },
       "additionalProperties": true
@@ -7999,10 +8011,38 @@
                   "use_openai_endpoints": {
                     "type": "boolean",
                     "description": "Per-alias override of use_openai_endpoints."
+                  },
+                  "effort_models": {
+                    "type": "object",
+                    "description": "Maps reasoning effort tiers (low, medium, high, default) to upstream model IDs for automatic effort-based model routing (Mode A).",
+                    "properties": {
+                      "low": {
+                        "type": "string"
+                      },
+                      "medium": {
+                        "type": "string"
+                      },
+                      "high": {
+                        "type": "string"
+                      },
+                      "default": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
                   }
                 },
-                "required": [
-                  "model_id"
+                "anyOf": [
+                  {
+                    "required": [
+                      "model_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "effort_models"
+                    ]
+                  }
                 ],
                 "additionalProperties": false
               }
@@ -14350,6 +14390,10 @@
             "deepseek",
             "gemini",
             "github-copilot",
+            "antigravity",
+            "codex",
+            "claude",
+            "grok",
             "openrouter",
             "elevenlabs",
             "huggingface",

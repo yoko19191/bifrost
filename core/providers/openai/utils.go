@@ -151,6 +151,10 @@ func omittedEffortReasons(caps schemas.ModelCaps, model string) bool {
 	return effort != "" && effort != schemas.ReasoningEffortNone
 }
 
+func isCPAOAuthProvider(provider schemas.ModelProvider) bool {
+	return provider == schemas.Antigravity || provider == schemas.Codex || provider == schemas.ClaudeOAuth || provider == schemas.GrokOAuth
+}
+
 // defaultEffortControl widens the base low/medium/high ladder with the effort
 // levels a model natively accepts. Only the widening is name-derived; the
 // datasheet's per-level booleans take precedence when a row exists.
@@ -158,14 +162,14 @@ func defaultEffortControl(provider schemas.ModelProvider, model string) *schemas
 	levels := []string{schemas.ReasoningEffortLow, schemas.ReasoningEffortMedium, schemas.ReasoningEffortHigh}
 	// BytePlus Ark accepts minimal/low/medium/high on every reasoning model; Baseten
 	// Model APIs accepts minimal through max, and models without a level ignore it.
-	if acceptsMinimalEffort(model) || provider == schemas.BytePlus || provider == schemas.Baseten {
+	if acceptsMinimalEffort(model) || provider == schemas.BytePlus || provider == schemas.Baseten || isCPAOAuthProvider(provider) {
 		levels = append([]string{schemas.ReasoningEffortMinimal}, levels...)
 	}
 	if includeXHighInDefaultLadder(provider, model) {
 		levels = append(levels, schemas.ReasoningEffortXHigh)
 	}
 	// MiniMax accepts "max" on every chat model (and defaults to it); M2.x ignores effort entirely.
-	if acceptsMaxEffort(model) || provider == schemas.MiniMax || provider == schemas.Baseten {
+	if acceptsMaxEffort(model) || provider == schemas.MiniMax || provider == schemas.Baseten || isCPAOAuthProvider(provider) {
 		levels = append(levels, schemas.ReasoningEffortMax)
 	}
 	return &schemas.EffortControl{Levels: levels}

@@ -74,6 +74,10 @@ export const ModelPlaceholders = {
 	cloudflare: "e.g. @cf/meta/llama-4-scout-17b-16e-instruct, @cf/baai/bge-large-en-v1.5",
 	"github-copilot": "e.g. gpt-5.5, claude-sonnet-4-6",
 	typesafe: "e.g. jev-1.13.0, jev-latest, jev-preview",
+	antigravity: "e.g. claude-opus-4-6, gemini-3.1-pro, gpt-5.3-codex",
+	codex: "e.g. gpt-5.3-codex, gpt-5.4, gpt-5.2-codex",
+	claude: "e.g. claude-opus-4-6, claude-sonnet-4-6",
+	grok: "e.g. grok-4, grok-3, grok-3-mini",
 };
 
 export const isKeyRequiredByProvider: Record<ProviderName, boolean> = {
@@ -115,6 +119,10 @@ export const isKeyRequiredByProvider: Record<ProviderName, boolean> = {
 	cloudflare: true,
 	"github-copilot": true,
 	typesafe: true,
+	antigravity: true,
+	codex: true,
+	claude: true,
+	grok: true,
 };
 
 export const DefaultNetworkConfig = {

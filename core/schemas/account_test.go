@@ -1167,3 +1167,60 @@ func BenchmarkKeyAliasesResolveConfig(b *testing.B) {
 		})
 	}
 }
+
+func TestEffortModelsAndSplitModelEffortSuffix(t *testing.T) {
+	// 1. SplitModelEffortSuffix
+	for _, tc := range []struct {
+		model      string
+		wantBase   string
+		wantEffort string
+		wantOK     bool
+	}{
+		{"claude-opus-4-6-low", "claude-opus-4-6", "low", true},
+		{"claude-opus-4-6-MEDIUM", "claude-opus-4-6", "medium", true},
+		{"claude-opus-4-6-high", "claude-opus-4-6", "high", true},
+		{"gpt-5-minimal", "gpt-5", "minimal", true},
+		{"gpt-5.3-codex-xhigh", "gpt-5.3-codex", "xhigh", true},
+		{"claude-opus-4-6-max", "claude-opus-4-6", "max", true},
+		{"claude-opus-4-6", "", "", false},
+		{"-high", "", "", false},
+		{"gpt-4o-mini", "", "", false},
+	} {
+		base, effort, ok := SplitModelEffortSuffix(tc.model)
+		if ok != tc.wantOK || base != tc.wantBase || effort != tc.wantEffort {
+			t.Fatalf("SplitModelEffortSuffix(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.model, base, effort, ok, tc.wantBase, tc.wantEffort, tc.wantOK)
+		}
+	}
+
+	// 2. EffortModels Normalize + Resolve + KeyAliases round-trip
+	rawJSON := `{"claude-opus-4-6":{"effort_models":{"low":"claude-opus-4-6-low","medium":"claude-opus-4-6-medium","high":"claude-opus-4-6-high"}}}`
+	var ka KeyAliases
+	if err := json.Unmarshal([]byte(rawJSON), &ka); err != nil {
+		t.Fatalf("Unmarshal KeyAliases with effort_models: %v", err)
+	}
+	if err := ka.Validate(Anthropic); err != nil {
+		t.Fatalf("Validate KeyAliases with effort_models: %v", err)
+	}
+	cfg := ka.ResolveConfig("claude-opus-4-6")
+	if cfg == nil {
+		t.Fatal("ResolveConfig(claude-opus-4-6) returned nil")
+	}
+	if cfg.ModelID != "claude-opus-4-6-medium" {
+		t.Fatalf("default ModelID = %q, want claude-opus-4-6-medium", cfg.ModelID)
+	}
+	if got := cfg.ResolveModelID("low", nil); got != "claude-opus-4-6-low" {
+		t.Fatalf("ResolveModelID(low) = %q, want claude-opus-4-6-low", got)
+	}
+	if got := cfg.ResolveModelID("xhigh", nil); got != "claude-opus-4-6-high" {
+		t.Fatalf("ResolveModelID(xhigh) = %q, want claude-opus-4-6-high", got)
+	}
+	budgetHigh := 16000
+	if got := cfg.ResolveModelID("", &budgetHigh); got != "claude-opus-4-6-high" {
+		t.Fatalf("ResolveModelID(budget=16000) = %q, want claude-opus-4-6-high", got)
+	}
+	// Mode B suffix resolution through KeyAliases.Resolve
+	if got := ka.Resolve("claude-opus-4-6-high"); got != "claude-opus-4-6-high" {
+		t.Fatalf("ka.Resolve(claude-opus-4-6-high) = %q, want claude-opus-4-6-high", got)
+	}
+}

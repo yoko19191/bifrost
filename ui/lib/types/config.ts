@@ -50,12 +50,20 @@ export const ModelFamilyValues: ModelFamily[] = [
 	"titan",
 ];
 
+export interface EffortModels {
+	low?: string;
+	medium?: string;
+	high?: string;
+	default?: string;
+}
+
 // AliasConfig matching Go's schemas.AliasConfig.
 // Go embeds AzureAliasCfg/VertexAliasCfg/BedrockAliasCfg/ReplicateAliasCfg as
 // pointer structs which flatten on the wire — sub-config fields live at the
 // top level of the JSON object.
 export interface AliasConfig {
 	model_id: string;
+	effort_models?: EffortModels;
 	model_name?: string;
 	model_family?: ModelFamily;
 	description?: string;
@@ -343,6 +351,76 @@ export interface GithubCopilotSignInPollResult {
 	interval?: number;
 	token?: string;
 	login?: string;
+}
+
+// OAuth channel sign-in & quota types (antigravity, codex, claude, grok)
+export interface OAuthDeviceState {
+	device_code: string;
+	user_code: string;
+	verification_uri: string;
+	verification_uri_complete?: string;
+	interval_seconds: number;
+	expires_at: string;
+}
+
+export interface OAuthStartResponse {
+	provider: string;
+	flow_type: "browser" | "device";
+	auth_url?: string;
+	state?: string;
+	verifier?: string;
+	redirect_uri?: string;
+	device_state?: OAuthDeviceState;
+}
+
+export interface OAuthCompleteRequest {
+	code?: string;
+	state?: string;
+	expected_state?: string;
+	verifier?: string;
+	callback_url?: string;
+	device_state?: OAuthDeviceState;
+	proxy_url?: string;
+}
+
+export interface OAuthCredentialResult {
+	provider: string;
+	status: "authorized" | "pending" | "callback_captured" | "slow_down" | "expired" | "denied";
+	interval?: number;
+	callback_url?: string;
+	error?: string;
+	credential_json?: string;
+	email?: string;
+	account_id?: string;
+	project_id?: string;
+	plan_type?: string;
+	expire?: string;
+	models?: string[];
+}
+
+export interface OAuthQuotaWindow {
+	id: string;
+	label: string;
+	used_percent?: number;
+	remaining_percent?: number;
+	reset_at?: string;
+}
+
+export interface OAuthQuotaObservation {
+	provider: string;
+	email?: string;
+	account_id?: string;
+	project_id?: string;
+	plan_type?: string;
+	rate_limited: boolean;
+	status_code?: number;
+	windows?: OAuthQuotaWindow[];
+	models?: string[];
+	credits?: {
+		has_credits: boolean;
+		unlimited: boolean;
+		balance: string;
+	};
 }
 
 // OAuthKeyConfig matching Go's schemas.OAuthKeyConfig. Honoured by openai and by custom

@@ -120,7 +120,40 @@ func (mc *ModelCatalog) computeModelsForProvider(provider schemas.ModelProvider)
 			out = append(out, m)
 		}
 	}
+	if isOAuthSubscriptionProvider(provider) && len(out) > 0 {
+		for _, fam := range schemas.DetectEffortFamilies(out) {
+			if blacklisted.IsBlocked(fam.BaseID) {
+				continue
+			}
+			if allowed != nil && !allowed.IsAllowed(fam.BaseID) {
+				// Also admit if any source tier model is allowed
+				anySourceAllowed := false
+				for _, src := range fam.SourceIDs {
+					if allowed.IsAllowed(src) {
+						anySourceAllowed = true
+						break
+					}
+				}
+				if !anySourceAllowed {
+					continue
+				}
+			}
+			if _, ok := seen[fam.BaseID]; !ok {
+				seen[fam.BaseID] = struct{}{}
+				out = append(out, fam.BaseID)
+			}
+		}
+	}
 	return out
+}
+
+func isOAuthSubscriptionProvider(provider schemas.ModelProvider) bool {
+	switch provider {
+	case schemas.Antigravity, schemas.Codex, schemas.ClaudeOAuth, schemas.GrokOAuth:
+		return true
+	default:
+		return false
+	}
 }
 
 func (mc *ModelCatalog) appendAllowedDatasheetModels(out []string, models []string, allowed schemas.WhiteList, blacklisted schemas.BlackList) []string {
@@ -156,28 +189,50 @@ func (mc *ModelCatalog) GetUnfilteredModelsForProvider(provider schemas.ModelPro
 		return liveModels
 	}
 	datasheetModels := mc.datasheet.DatasheetModelsForProvider(provider)
-	if len(liveModels) == 0 {
-		return datasheetModels
-	}
-	if len(datasheetModels) == 0 {
-		return liveModels
-	}
-	seen := make(map[string]struct{}, len(liveModels)+len(datasheetModels))
-	out := make([]string, 0, len(liveModels)+len(datasheetModels))
-	for _, m := range liveModels {
-		if _, ok := seen[m]; !ok {
-			seen[m] = struct{}{}
-			out = append(out, m)
+	var base []string
+	switch {
+	case len(liveModels) == 0:
+		base = datasheetModels
+	case len(datasheetModels) == 0:
+		base = liveModels
+	default:
+		seen := make(map[string]struct{}, len(liveModels)+len(datasheetModels))
+		base = make([]string, 0, len(liveModels)+len(datasheetModels))
+		for _, m := range liveModels {
+			if _, ok := seen[m]; !ok {
+				seen[m] = struct{}{}
+				base = append(base, m)
+			}
+		}
+		for _, m := range datasheetModels {
+			if _, ok := seen[m]; !ok {
+				seen[m] = struct{}{}
+				base = append(base, m)
+			}
 		}
 	}
-	for _, m := range datasheetModels {
-		if _, ok := seen[m]; !ok {
-			seen[m] = struct{}{}
-			out = append(out, m)
+	if isOAuthSubscriptionProvider(provider) && len(base) > 0 {
+		seen := make(map[string]struct{}, len(base))
+		out := make([]string, 0, len(base)+8)
+		for _, m := range base {
+			if _, ok := seen[m]; !ok {
+				seen[m] = struct{}{}
+				out = append(out, m)
+			}
 		}
+		for _, fam := range schemas.DetectEffortFamilies(out) {
+			if _, ok := seen[fam.BaseID]; !ok {
+				seen[fam.BaseID] = struct{}{}
+				out = append(out, fam.BaseID)
+			}
+		}
+		slices.Sort(out)
+		return out
 	}
-	slices.Sort(out)
-	return out
+	if len(liveModels) > 0 && len(datasheetModels) > 0 {
+		slices.Sort(base)
+	}
+	return base
 }
 
 // GetDistinctBaseModelNames returns all unique base model names from the
@@ -237,14 +292,27 @@ func (mc *ModelCatalog) GetProvidersForModel(model string) []schemas.ModelProvid
 // including the openrouter / vertex / groq-gpt / bedrock-claude special cases.
 func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelProvider {
 	baseModel := mc.datasheet.BaseModelName(model)
+	effortBase, _, hasEffortSuffix := schemas.SplitModelEffortSuffix(model)
+	var effortDatasheetBase string
+	if hasEffortSuffix {
+		effortDatasheetBase = mc.datasheet.BaseModelName(effortBase)
+	}
 
 	providers := make([]schemas.ModelProvider, 0)
 	seen := make(map[schemas.ModelProvider]struct{})
 	for _, p := range mc.knownProviders() {
+		if mc.keyconf.BlacklistedFor(p).IsBlocked(model) {
+			continue
+		}
 		models := mc.GetModelsForProvider(p)
 		matched := false
 		for _, m := range models {
-			if m == model || mc.datasheet.BaseModelName(m) == baseModel {
+			mBase := mc.datasheet.BaseModelName(m)
+			if m == model || mBase == baseModel {
+				matched = true
+				break
+			}
+			if hasEffortSuffix && (m == effortBase || mBase == effortDatasheetBase) {
 				matched = true
 				break
 			}
@@ -261,7 +329,8 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 	if _, ok := seen[schemas.OpenRouter]; !ok {
 		openRouterModels := mc.GetModelsForProvider(schemas.OpenRouter)
 		for _, p := range providers {
-			if slices.Contains(openRouterModels, string(p)+"/"+model) {
+			if slices.Contains(openRouterModels, string(p)+"/"+model) ||
+				(hasEffortSuffix && slices.Contains(openRouterModels, string(p)+"/"+effortBase)) {
 				providers = append(providers, schemas.OpenRouter)
 				seen[schemas.OpenRouter] = struct{}{}
 				break
@@ -271,7 +340,8 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 	if _, ok := seen[schemas.Vertex]; !ok {
 		vertexModels := mc.GetModelsForProvider(schemas.Vertex)
 		for _, p := range providers {
-			if slices.Contains(vertexModels, string(p)+"/"+model) {
+			if slices.Contains(vertexModels, string(p)+"/"+model) ||
+				(hasEffortSuffix && slices.Contains(vertexModels, string(p)+"/"+effortBase)) {
 				providers = append(providers, schemas.Vertex)
 				seen[schemas.Vertex] = struct{}{}
 				break
@@ -279,13 +349,16 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 		}
 	}
 	if _, ok := seen[schemas.Groq]; !ok && strings.Contains(model, "gpt-") {
-		if slices.Contains(mc.GetModelsForProvider(schemas.Groq), "openai/"+model) {
+		groqModels := mc.GetModelsForProvider(schemas.Groq)
+		if slices.Contains(groqModels, "openai/"+model) ||
+			(hasEffortSuffix && slices.Contains(groqModels, "openai/"+effortBase)) {
 			providers = append(providers, schemas.Groq)
 		}
 	}
 	if _, ok := seen[schemas.Bedrock]; !ok && strings.Contains(model, "claude") {
 		for _, bedrockModel := range mc.GetModelsForProvider(schemas.Bedrock) {
-			if strings.Contains(bedrockModel, model) {
+			if strings.Contains(bedrockModel, model) ||
+				(hasEffortSuffix && strings.Contains(bedrockModel, effortBase)) {
 				providers = append(providers, schemas.Bedrock)
 				break
 			}
@@ -303,12 +376,21 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 		matched := false
 		if _, hit := mc.keyconf.ResolveAlias(p, model); hit && allowed.IsAllowed(model) {
 			matched = true
-		} else if allowed.Contains(model) {
-			matched = true
-		} else if allowed.IsUnrestricted() &&
-			len(mc.datasheet.DatasheetModelsForProvider(p)) == 0 &&
-			len(mc.live.UnfilteredModelsForProvider(p)) == 0 {
-			matched = true
+		} else if hasEffortSuffix && !mc.keyconf.BlacklistedFor(p).IsBlocked(effortBase) {
+			if _, hit := mc.keyconf.ResolveAlias(p, effortBase); hit && allowed.IsAllowed(effortBase) {
+				matched = true
+			} else if allowed.Contains(effortBase) {
+				matched = true
+			}
+		}
+		if !matched {
+			if allowed.Contains(model) {
+				matched = true
+			} else if allowed.IsUnrestricted() &&
+				len(mc.datasheet.DatasheetModelsForProvider(p)) == 0 &&
+				len(mc.live.UnfilteredModelsForProvider(p)) == 0 {
+				matched = true
+			}
 		}
 		if matched {
 			providers = append(providers, p)
@@ -350,6 +432,10 @@ func (mc *ModelCatalog) IsModelAllowedForProvider(provider schemas.ModelProvider
 	if allowedModels.Contains(model) {
 		return true
 	}
+	effortBase, _, hasEffortSuffix := schemas.SplitModelEffortSuffix(model)
+	if hasEffortSuffix && allowedModels.Contains(effortBase) {
+		return true
+	}
 
 	// Only provider-prefixed entries ("openai/gpt-4o") need the provider
 	// catalog; build it once, and only when one exists.
@@ -363,7 +449,7 @@ func (mc *ModelCatalog) IsModelAllowedForProvider(provider schemas.ModelProvider
 		}
 		if slices.Contains(providerCatalogModels, allowedModel) {
 			_, modelPart := schemas.ParseModelString(allowedModel, "")
-			if modelPart == model {
+			if modelPart == model || (hasEffortSuffix && modelPart == effortBase) {
 				return true
 			}
 		}

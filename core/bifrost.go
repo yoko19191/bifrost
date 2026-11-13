@@ -31,6 +31,7 @@ import (
 	"github.com/maximhq/bifrost/core/providers/cerebras"
 	"github.com/maximhq/bifrost/core/providers/cloudflare"
 	"github.com/maximhq/bifrost/core/providers/cohere"
+	"github.com/maximhq/bifrost/core/providers/cpaoauth"
 	"github.com/maximhq/bifrost/core/providers/databricks"
 	"github.com/maximhq/bifrost/core/providers/deepseek"
 	"github.com/maximhq/bifrost/core/providers/elevenlabs"
@@ -5273,6 +5274,8 @@ func (bifrost *Bifrost) createBaseProvider(providerKey schemas.ModelProvider, co
 		return opencode.NewOpencodeZenProvider(config, bifrost.logger)
 	case schemas.GithubCopilot:
 		return githubcopilot.NewGithubCopilotProvider(config, bifrost.logger)
+	case schemas.Antigravity, schemas.Codex, schemas.ClaudeOAuth, schemas.GrokOAuth:
+		return cpaoauth.NewProvider(targetProviderKey, config, bifrost.logger)
 	case schemas.SGL:
 		return sgl.NewSGLProvider(config, bifrost.logger)
 	case schemas.Parasail:
@@ -8438,6 +8441,8 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 		}
 
 		originalModelRequested := model
+		callerEffort, callerMaxTokens := extractRequestReasoning(&req.BifrostRequest)
+		suffixEffortInjected := false
 		// resolvedModel is set inside the handler closures below on every attempt so that each
 		// key's own alias mapping is applied. The outer var holds the LAST attempt's value and is
 		// read single-threaded by the worker after retries finish (e.g. the error-fallback at
@@ -8490,17 +8495,10 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				if abort := providerUtils.NewAttemptAbort(req.firstTokenTimeout); abort != nil {
 					req.Context.SetValue(schemas.BifrostContextKeyStreamAttemptAbort, abort)
 				}
-				if aliasConfig := k.Aliases.ResolveConfig(originalModelRequested); aliasConfig != nil {
-					resolvedModel = aliasConfig.ModelID
-					req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: originalModelRequested, Config: aliasConfig})
-				} else {
-					resolvedModel = originalModelRequested
-					req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, nil)
-				}
-				req.SetModel(resolvedModel)
-				// An earlier attempt with injected tools may have switched passthrough off;
-				// this attempt decides afresh from the caller's settings.
+				// An earlier attempt with injected tools or Mode B effort injection may have switched
+				// passthrough off; this attempt decides afresh from the caller's settings.
 				restoreAnthropicPassthroughAfterInjectedTools(req.Context)
+				resolvedModel = bifrost.resolveAttemptModel(req, k, provider.GetProviderKey(), originalModelRequested, callerEffort, callerMaxTokens, &suffixEffortInjected)
 				// Disable Anthropic raw-body passthrough when this attempt's provider/model isn't Anthropic-native.
 				clearAnthropicPassthroughForNonNativeProvider(req.Context, baseProvider, resolvedModel)
 				// Disable it too when this attempt's provider has no native structured outputs.
@@ -8632,17 +8630,10 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 			}, keyProvider, req.RequestType, provider.GetProviderKey(), model, &req.BifrostRequest, bifrost.logger)
 		} else {
 			result, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (*schemas.BifrostResponse, *schemas.BifrostError) {
-				if aliasConfig := k.Aliases.ResolveConfig(originalModelRequested); aliasConfig != nil {
-					resolvedModel = aliasConfig.ModelID
-					req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: originalModelRequested, Config: aliasConfig})
-				} else {
-					resolvedModel = originalModelRequested
-					req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, nil)
-				}
-				req.SetModel(resolvedModel)
-				// An earlier attempt with injected tools may have switched passthrough off;
-				// this attempt decides afresh from the caller's settings.
+				// An earlier attempt with injected tools or Mode B effort injection may have switched
+				// passthrough off; this attempt decides afresh from the caller's settings.
 				restoreAnthropicPassthroughAfterInjectedTools(req.Context)
+				resolvedModel = bifrost.resolveAttemptModel(req, k, provider.GetProviderKey(), originalModelRequested, callerEffort, callerMaxTokens, &suffixEffortInjected)
 				req.Context.SetValue(schemas.BifrostContextKeyInjectedToolsExecuted, false)
 				// Disable Anthropic raw-body passthrough when this attempt's provider/model isn't Anthropic-native.
 				clearAnthropicPassthroughForNonNativeProvider(req.Context, baseProvider, resolvedModel)
@@ -11287,12 +11278,234 @@ func pinKeys(ctx *schemas.BifrostContext, keys []schemas.Key, providerKey schema
 	return keys, nil
 }
 
+// extractRequestReasoning returns the caller-specified reasoning effort and max_tokens from a Chat or Responses request.
+func extractRequestReasoning(req *schemas.BifrostRequest) (effort string, maxTokens *int) {
+	if req == nil {
+		return "", nil
+	}
+	if req.ChatRequest != nil && req.ChatRequest.Params != nil && req.ChatRequest.Params.Reasoning != nil {
+		r := req.ChatRequest.Params.Reasoning
+		if r.Effort != nil {
+			effort = strings.TrimSpace(*r.Effort)
+		}
+		maxTokens = r.MaxTokens
+		return effort, maxTokens
+	}
+	if req.ResponsesRequest != nil && req.ResponsesRequest.Params != nil && req.ResponsesRequest.Params.Reasoning != nil {
+		r := req.ResponsesRequest.Params.Reasoning
+		if r.Effort != nil {
+			effort = strings.TrimSpace(*r.Effort)
+		}
+		maxTokens = r.MaxTokens
+		return effort, maxTokens
+	}
+	return "", nil
+}
+
+// setRequestReasoningEffort sets (or clears when effort == nil) the reasoning effort on a Chat or Responses request.
+func setRequestReasoningEffort(req *schemas.BifrostRequest, effort *string) {
+	if req == nil {
+		return
+	}
+	if req.ChatRequest != nil {
+		if effort == nil {
+			if req.ChatRequest.Params != nil && req.ChatRequest.Params.Reasoning != nil {
+				req.ChatRequest.Params.Reasoning.Effort = nil
+			}
+			return
+		}
+		if req.ChatRequest.Params == nil {
+			req.ChatRequest.Params = &schemas.ChatParameters{}
+		}
+		if req.ChatRequest.Params.Reasoning == nil {
+			req.ChatRequest.Params.Reasoning = &schemas.ChatReasoning{}
+		}
+		req.ChatRequest.Params.Reasoning.Effort = effort
+	}
+	if req.ResponsesRequest != nil {
+		if effort == nil {
+			if req.ResponsesRequest.Params != nil && req.ResponsesRequest.Params.Reasoning != nil {
+				req.ResponsesRequest.Params.Reasoning.Effort = nil
+			}
+			return
+		}
+		if req.ResponsesRequest.Params == nil {
+			req.ResponsesRequest.Params = &schemas.ResponsesParameters{}
+		}
+		if req.ResponsesRequest.Params.Reasoning == nil {
+			req.ResponsesRequest.Params.Reasoning = &schemas.ResponsesParametersReasoning{}
+		}
+		req.ResponsesRequest.Params.Reasoning.Effort = effort
+	}
+}
+
+// isLiteralProviderModel reports whether model is explicitly declared as a literal upstream model
+// on key.Models or in the provider's unfiltered model catalog.
+func (bifrost *Bifrost) isLiteralProviderModel(providerKey schemas.ModelProvider, key *schemas.Key, model string) bool {
+	if key != nil {
+		for _, entry := range key.Models {
+			if entry == "*" || schemas.IsRegexEntry(entry) {
+				continue
+			}
+			if strings.EqualFold(entry, model) {
+				return true
+			}
+		}
+	}
+	if bifrost != nil {
+		if lister, ok := bifrost.getModelCatalog().(providerModelLister); ok {
+			for _, m := range lister.GetUnfilteredModelsForProvider(providerKey) {
+				if strings.EqualFold(m, model) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// resolveAutoEffortAlias synthesizes an EffortModels AliasConfig for model when the key or
+// provider catalog exposes tiered (<base>-low/medium/high) or thinking (<base>-thinking) models.
+func (bifrost *Bifrost) resolveAutoEffortAlias(providerKey schemas.ModelProvider, key *schemas.Key, model string) *schemas.AliasConfig {
+	var candidates []string
+	if key != nil && len(key.Models) > 0 {
+		for _, entry := range key.Models {
+			if entry != "*" && !schemas.IsRegexEntry(entry) {
+				candidates = append(candidates, entry)
+			}
+		}
+	}
+	if bifrost != nil {
+		if lister, ok := bifrost.getModelCatalog().(providerModelLister); ok {
+			candidates = append(candidates, lister.GetUnfilteredModelsForProvider(providerKey)...)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	autoAliases := schemas.BuildAutoEffortAliases(candidates)
+	if len(autoAliases) == 0 {
+		return nil
+	}
+	return autoAliases.ResolveConfig(model)
+}
+
+// resolveAttemptModel resolves the target upstream model for a per-attempt key, supporting both:
+//   - Mode A (EffortModels on AliasConfig or auto-detected tiered/thinking family): dynamically selects low/medium/high upstream model ID based on reasoning effort/budget.
+//   - Mode B (Virtual Suffix Decomposition): decomposes <base>-low|medium|high|minimal|xhigh|max into <base> + injected reasoning.effort.
+func (bifrost *Bifrost) resolveAttemptModel(
+	req *ChannelMessage,
+	key schemas.Key,
+	providerKey schemas.ModelProvider,
+	originalModel string,
+	callerEffort string,
+	callerMaxTokens *int,
+	suffixEffortInjected *bool,
+) string {
+	if suffixEffortInjected != nil && *suffixEffortInjected && callerEffort == "" {
+		setRequestReasoningEffort(&req.BifrostRequest, nil)
+		*suffixEffortInjected = false
+	}
+
+	aliasConfig := key.Aliases.ResolveConfig(originalModel)
+	if aliasConfig == nil {
+		aliasConfig = bifrost.resolveAutoEffortAlias(providerKey, &key, originalModel)
+	}
+	if aliasConfig != nil {
+		resolvedModel := aliasConfig.ResolveModelID(callerEffort, callerMaxTokens)
+		if resolvedModel != aliasConfig.ModelID {
+			copied := *aliasConfig
+			copied.ModelID = resolvedModel
+			aliasConfig = &copied
+		}
+		req.SetModel(resolvedModel)
+		req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: originalModel, Config: aliasConfig})
+		return resolvedModel
+	}
+
+	if baseModel, suffixEffort, hasSuffix := schemas.SplitModelEffortSuffix(originalModel); hasSuffix {
+		effectiveEffort := callerEffort
+		if effectiveEffort == "" {
+			effectiveEffort = suffixEffort
+		}
+		baseAliasConfig := key.Aliases.ResolveConfig(baseModel)
+		if baseAliasConfig == nil {
+			baseAliasConfig = bifrost.resolveAutoEffortAlias(providerKey, &key, baseModel)
+		}
+		if baseAliasConfig != nil {
+			resolvedModel := baseAliasConfig.ResolveModelID(effectiveEffort, callerMaxTokens)
+			if resolvedModel != baseAliasConfig.ModelID {
+				copied := *baseAliasConfig
+				copied.ModelID = resolvedModel
+				baseAliasConfig = &copied
+			}
+			if callerEffort == "" && callerMaxTokens == nil {
+				effortVal := suffixEffort
+				setRequestReasoningEffort(&req.BifrostRequest, &effortVal)
+				if suffixEffortInjected != nil {
+					*suffixEffortInjected = true
+				}
+				if hasTypedInput(&req.BifrostRequest) {
+					saveAndDisableAnthropicPassthrough(req.Context)
+				}
+			}
+			req.SetModel(resolvedModel)
+			req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: baseModel, Config: baseAliasConfig})
+			return resolvedModel
+		}
+
+		if !bifrost.isLiteralProviderModel(providerKey, &key, originalModel) {
+			if callerEffort == "" && callerMaxTokens == nil {
+				effortVal := suffixEffort
+				setRequestReasoningEffort(&req.BifrostRequest, &effortVal)
+				if suffixEffortInjected != nil {
+					*suffixEffortInjected = true
+				}
+				if hasTypedInput(&req.BifrostRequest) {
+					saveAndDisableAnthropicPassthrough(req.Context)
+				}
+			}
+			req.SetModel(baseModel)
+			req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, nil)
+			return baseModel
+		}
+	}
+
+	req.SetModel(originalModel)
+	req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, nil)
+	return originalModel
+}
+
 // applyKeyAlias points the request's model at this key's alias, as the per-attempt closure does for a selected key.
 func applyKeyAlias(req *ChannelMessage, key schemas.Key, originalModel string) {
+	callerEffort, callerMaxTokens := extractRequestReasoning(&req.BifrostRequest)
 	if aliasConfig := key.Aliases.ResolveConfig(originalModel); aliasConfig != nil {
-		req.SetModel(aliasConfig.ModelID)
+		resolvedModel := aliasConfig.ResolveModelID(callerEffort, callerMaxTokens)
+		if resolvedModel != aliasConfig.ModelID {
+			copied := *aliasConfig
+			copied.ModelID = resolvedModel
+			aliasConfig = &copied
+		}
+		req.SetModel(resolvedModel)
 		req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: originalModel, Config: aliasConfig})
 		return
+	}
+	if baseModel, suffixEffort, hasSuffix := schemas.SplitModelEffortSuffix(originalModel); hasSuffix {
+		effectiveEffort := callerEffort
+		if effectiveEffort == "" {
+			effectiveEffort = suffixEffort
+		}
+		if aliasConfig := key.Aliases.ResolveConfig(baseModel); aliasConfig != nil {
+			resolvedModel := aliasConfig.ResolveModelID(effectiveEffort, callerMaxTokens)
+			if resolvedModel != aliasConfig.ModelID {
+				copied := *aliasConfig
+				copied.ModelID = resolvedModel
+				aliasConfig = &copied
+			}
+			req.SetModel(resolvedModel)
+			req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: baseModel, Config: aliasConfig})
+			return
+		}
 	}
 	req.SetModel(originalModel)
 	req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, nil)
@@ -11546,11 +11759,45 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 
 // keySupportsModel reports whether a key's allow list, deny list and vLLM served model admit model.
 func keySupportsModel(baseProviderType schemas.ModelProvider, key *schemas.Key, model string) bool {
-	if !key.Models.IsAllowed(model) || key.BlacklistedModels.IsBlocked(model) {
+	if key.BlacklistedModels.IsBlocked(model) {
+		return false
+	}
+	checkAllowedOrSynthesized := func(target string) bool {
+		if key.Models.IsAllowed(target) {
+			return true
+		}
+		if !key.Models.IsEmpty() {
+			if key.Aliases.ResolveConfig(target) != nil {
+				return true
+			}
+			for _, sfx := range []string{"-thinking", "-low", "-medium", "-high"} {
+				if key.Models.IsAllowed(target + sfx) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	allowed := checkAllowedOrSynthesized(model)
+	if !allowed {
+		if baseModel, _, hasSuffix := schemas.SplitModelEffortSuffix(model); hasSuffix {
+			if !key.BlacklistedModels.IsBlocked(baseModel) && checkAllowedOrSynthesized(baseModel) {
+				allowed = true
+			}
+		}
+	}
+	if !allowed {
 		return false
 	}
 	if baseProviderType == schemas.VLLM && key.VLLMKeyConfig != nil && key.VLLMKeyConfig.ModelName != "" {
-		return key.VLLMKeyConfig.ModelName == key.Aliases.Resolve(model)
+		resolved := key.Aliases.Resolve(model)
+		if key.VLLMKeyConfig.ModelName == resolved {
+			return true
+		}
+		if baseModel, _, hasSuffix := schemas.SplitModelEffortSuffix(model); hasSuffix {
+			return key.VLLMKeyConfig.ModelName == key.Aliases.Resolve(baseModel)
+		}
+		return false
 	}
 	return true
 }

@@ -232,8 +232,18 @@ func (p *ListModelsPipeline) resolveModelID(modelID string) []aliasMatch {
 		if schemas.IsRegexEntry(aliasKey) {
 			continue
 		}
-		if matches(modelID, alias.ModelID, p.MatchFns) {
-			candidates = append(candidates, aliasMatch{key: aliasKey, value: alias.ModelID})
+		effectiveID := alias.EffectiveModelID()
+		matched := effectiveID != "" && matches(modelID, effectiveID, p.MatchFns)
+		if !matched && !alias.EffortModels.IsEmpty() {
+			for _, effortModel := range alias.EffortModels.Models() {
+				if matches(modelID, effortModel, p.MatchFns) {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
+			candidates = append(candidates, aliasMatch{key: aliasKey, value: effectiveID})
 		}
 	}
 	if len(candidates) == 0 {
@@ -378,7 +388,7 @@ func (p *ListModelsPipeline) BackfillModels(included map[string]bool) []schemas.
 			// If this allowlist entry has an alias, surface the provider-specific ID.
 			for aliasKey, alias := range p.Aliases {
 				if !schemas.IsRegexEntry(aliasKey) && matches(entry, aliasKey, p.MatchFns) {
-					m.Alias = schemas.Ptr(alias.ModelID)
+					m.Alias = schemas.Ptr(alias.EffectiveModelID())
 					break
 				}
 			}
@@ -411,7 +421,7 @@ func (p *ListModelsPipeline) BackfillModels(included map[string]bool) []schemas.
 			result = append(result, schemas.Model{
 				ID:    string(p.ProviderKey) + "/" + aliasKey,
 				Name:  schemas.Ptr(ToDisplayName(aliasKey)),
-				Alias: schemas.Ptr(alias.ModelID),
+				Alias: schemas.Ptr(alias.EffectiveModelID()),
 			})
 		}
 		return result
@@ -437,7 +447,7 @@ func (p *ListModelsPipeline) BackfillModels(included map[string]bool) []schemas.
 			result = append(result, schemas.Model{
 				ID:    string(p.ProviderKey) + "/" + aliasKey,
 				Name:  schemas.Ptr(ToDisplayName(aliasKey)),
-				Alias: schemas.Ptr(alias.ModelID),
+				Alias: schemas.Ptr(alias.EffectiveModelID()),
 			})
 		}
 	}

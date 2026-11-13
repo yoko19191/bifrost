@@ -770,42 +770,60 @@ export const modelFamilySchema = z.enum([
 	"titan",
 ]);
 
+export const effortModelsSchema = z.object({
+	low: z.string().trim().optional(),
+	medium: z.string().trim().optional(),
+	high: z.string().trim().optional(),
+	default: z.string().trim().optional(),
+});
+
+export function hasEffortModelsConfigured(em: z.input<typeof effortModelsSchema> | undefined): boolean {
+	if (!em) return false;
+	return !!(em.low?.trim() || em.medium?.trim() || em.high?.trim() || em.default?.trim());
+}
+
 // AliasConfig schema — mirrors schemas.AliasConfig with the embedded
 // provider sub-configs flattened to top-level optional fields (matches Go's
 // embedded-pointer-struct JSON output).
-const aliasConfigObjectSchema = z.object({
-	model_id: z.string().trim().min(1, msg("validation.modelIdIsRequired")),
-	model_name: z.string().trim().optional(),
-	model_family: modelFamilySchema.optional(),
-	description: z.string().optional(),
-	region: secretVarSchema.optional(),
-	// Azure overrides
-	api_version: z.string().optional(),
-	anthropic_version: z.string().optional(),
-	endpoint: secretVarSchema.optional(),
-	use_speech_endpoints: z.boolean().optional(),
-	use_voice_live_endpoints: z.boolean().optional(),
-	// Shared per-alias project override (Vertex / Bedrock / Bedrock Mantle)
-	project_id: secretVarSchema.optional(),
-	// Vertex overrides
-	project_number: secretVarSchema.optional(),
-	force_single_region: z.boolean().optional(),
-	vertex_endpoint: z
-		.object({
-			endpoint_id: z.string().regex(/^[A-Za-z0-9_-]+$/, msg("validation.vertexEndpointId")),
-			format: z.enum(["openai_chat"]),
-			method: z.enum(["raw_predict", "chat_completions"]).optional(),
-		})
-		.optional(),
-	// Bedrock overrides
-	inference_profile_arn: secretVarSchema.optional(),
-	// Replicate overrides
-	use_deployments_endpoint: z.boolean().optional(),
-	// Baseten overrides
-	deployment_url: secretVarSchema.optional().refine(isLiteralHTTPSURL, msg("validation.basetenDeploymentUrl")),
-	use_anthropic_endpoints: z.boolean().optional(),
-	use_openai_endpoints: z.boolean().optional(),
-});
+const aliasConfigObjectSchema = z
+	.object({
+		model_id: z.string().trim().optional().default(""),
+		effort_models: effortModelsSchema.optional(),
+		model_name: z.string().trim().optional(),
+		model_family: modelFamilySchema.optional(),
+		description: z.string().optional(),
+		region: secretVarSchema.optional(),
+		// Azure overrides
+		api_version: z.string().optional(),
+		anthropic_version: z.string().optional(),
+		endpoint: secretVarSchema.optional(),
+		use_speech_endpoints: z.boolean().optional(),
+		use_voice_live_endpoints: z.boolean().optional(),
+		// Shared per-alias project override (Vertex / Bedrock / Bedrock Mantle)
+		project_id: secretVarSchema.optional(),
+		// Vertex overrides
+		project_number: secretVarSchema.optional(),
+		force_single_region: z.boolean().optional(),
+		vertex_endpoint: z
+			.object({
+				endpoint_id: z.string().regex(/^[A-Za-z0-9_-]+$/, msg("validation.vertexEndpointId")),
+				format: z.enum(["openai_chat"]),
+				method: z.enum(["raw_predict", "chat_completions"]).optional(),
+			})
+			.optional(),
+		// Bedrock overrides
+		inference_profile_arn: secretVarSchema.optional(),
+		// Replicate overrides
+		use_deployments_endpoint: z.boolean().optional(),
+		// Baseten overrides
+		deployment_url: secretVarSchema.optional().refine(isLiteralHTTPSURL, msg("validation.basetenDeploymentUrl")),
+		use_anthropic_endpoints: z.boolean().optional(),
+		use_openai_endpoints: z.boolean().optional(),
+	})
+	.refine((data) => !!data.model_id?.trim() || hasEffortModelsConfigured(data.effort_models), {
+		error: () => i18n.t("validation.modelIdIsRequired"),
+		path: ["model_id"],
+	});
 
 // The Go server emits the legacy string wire shape (`{"my-alias": "model-id"}`)
 // for aliases that only carry ModelID — see AliasConfig.MarshalJSON. Accept

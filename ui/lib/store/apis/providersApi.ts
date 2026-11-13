@@ -8,6 +8,10 @@ import {
 	ModelProvider,
 	ModelProviderKey,
 	ModelProviderName,
+	OAuthCompleteRequest,
+	OAuthCredentialResult,
+	OAuthQuotaObservation,
+	OAuthStartResponse,
 	UpdateProviderRequest,
 	UpdateProviderKeyRequest,
 } from "@/lib/types/config";
@@ -300,6 +304,42 @@ export const providersApi = baseApi.injectEndpoints({
 				url: `/providers/${encodeURIComponent(provider)}/sign-in/poll`,
 				method: "POST",
 				body: { device_code: deviceCode },
+			}),
+		}),
+
+		// OAuth subscription channels (antigravity, codex, claude, grok)
+		startOAuthChannelSignIn: builder.mutation<OAuthStartResponse, { provider: string; proxy_url?: string }>({
+			query: ({ provider, proxy_url }) => ({
+				url: `/providers/${encodeURIComponent(provider)}/oauth/start`,
+				method: "POST",
+				body: proxy_url ? { proxy_url } : {},
+			}),
+		}),
+
+		completeOAuthChannelSignIn: builder.mutation<OAuthCredentialResult, { provider: string } & OAuthCompleteRequest>({
+			query: ({ provider, ...body }) => ({
+				url: `/providers/${encodeURIComponent(provider)}/oauth/complete`,
+				method: "POST",
+				body,
+			}),
+		}),
+
+		importOAuthChannelCredential: builder.mutation<OAuthCredentialResult, { provider: string; raw_json: string; proxy_url?: string }>({
+			query: ({ provider, ...body }) => ({
+				url: `/providers/${encodeURIComponent(provider)}/oauth/import`,
+				method: "POST",
+				body,
+			}),
+		}),
+
+		getOAuthChannelQuota: builder.mutation<
+			OAuthQuotaObservation,
+			{ provider: string; credential?: string; key_id?: string; key_name?: string; proxy_url?: string }
+		>({
+			query: ({ provider, ...body }) => ({
+				url: `/providers/${encodeURIComponent(provider)}/oauth/quota`,
+				method: "POST",
+				body,
 			}),
 		}),
 
@@ -697,6 +737,10 @@ export const {
 	useUpsertModelCatalogEntriesMutation,
 	useStartGithubCopilotSignInMutation,
 	usePollGithubCopilotSignInMutation,
+	useStartOAuthChannelSignInMutation,
+	useCompleteOAuthChannelSignInMutation,
+	useImportOAuthChannelCredentialMutation,
+	useGetOAuthChannelQuotaMutation,
 	useGetDatasheetEntriesQuery,
 	useGetDatasheetEntryQuery,
 	useSaveDatasheetOverrideMutation,

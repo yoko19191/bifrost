@@ -865,6 +865,20 @@ func clearAnthropicPassthroughForInjectedTools(ctx *schemas.BifrostContext, set 
 	if !hasTypedInput(req) {
 		return nil
 	}
+	saveAndDisableAnthropicPassthrough(ctx)
+	return set
+}
+
+// saveAndDisableAnthropicPassthrough snapshots the current passthrough context flags (if not
+// already snapshotted for this attempt) and disables raw-body passthrough so typed mutations
+// (such as injected tools or Mode B effort-suffix injection) take effect on the wire.
+func saveAndDisableAnthropicPassthrough(ctx *schemas.BifrostContext) {
+	if ctx == nil {
+		return
+	}
+	if useRaw, _ := ctx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool); !useRaw {
+		return
+	}
 	if _, saved := ctx.Value(injectedToolsPassthroughKey).(*passthroughSnapshot); !saved {
 		snapshot := &passthroughSnapshot{values: make(map[schemas.BifrostContextKey]any, len(passthroughKeys))}
 		for _, key := range passthroughKeys {
@@ -873,7 +887,6 @@ func clearAnthropicPassthroughForInjectedTools(ctx *schemas.BifrostContext, set 
 		ctx.SetValue(injectedToolsPassthroughKey, snapshot)
 	}
 	disableAnthropicPassthrough(ctx)
-	return set
 }
 
 // restoreAnthropicPassthroughAfterInjectedTools puts back the passthrough settings an

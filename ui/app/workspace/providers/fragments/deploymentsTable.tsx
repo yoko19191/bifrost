@@ -1,4 +1,5 @@
 import { isRegexEntry, validatePatternAlias } from "@/components/modelAccess/utils";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { SecretVarInput } from "@/components/ui/secretVarInput";
@@ -7,11 +8,12 @@ import { ModelSelector } from "@/components/ui/modelSelector";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { AliasConfig, ModelFamily, ModelFamilyValues } from "@/lib/types/config";
-import { isLiteralHTTPSURL, SecretVar } from "@/lib/types/schemas";
+import { AliasConfig, EffortModels, ModelFamily, ModelFamilyValues } from "@/lib/types/config";
+import { useGetModelsQuery } from "@/lib/store";
+import { hasEffortModelsConfigured, isLiteralHTTPSURL, SecretVar } from "@/lib/types/schemas";
 import { cn } from "@/lib/utils";
 import { parseVertexEndpointURL } from "@/lib/vertexEndpoint";
-import { ChevronDown, ChevronRight, Regex, Trash } from "lucide-react";
+import { ChevronDown, ChevronRight, Layers, Regex, Sparkles, Trash, Wand2 } from "lucide-react";
 import { useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -21,6 +23,8 @@ interface Props {
 	value: DeploymentsValue;
 	onChange: (next: Record<string, AliasConfig>) => void;
 	providerName: string;
+	availableModels?: string[];
+	onCleanSourceModels?: (sourceIdsToRemove: string[], fusedBaseIdsToAdd: string[]) => void;
 	disabled?: boolean;
 }
 
@@ -531,13 +535,357 @@ function ProviderSection({ providerName, ...props }: ProviderSectionProps & { pr
 	}
 }
 
+const EFFORT_SUFFIXES = ["-minimal", "-low", "-medium", "-high", "-xhigh", "-max"] as const;
+
+function cleanEffortModels(next: EffortModels): EffortModels | undefined {
+	const cleaned: EffortModels = {};
+	if (next.low?.trim()) cleaned.low = next.low.trim();
+	if (next.medium?.trim()) cleaned.medium = next.medium.trim();
+	if (next.high?.trim()) cleaned.high = next.high.trim();
+	if (next.default?.trim()) cleaned.default = next.default.trim();
+	return hasEffortModelsConfigured(cleaned) ? cleaned : undefined;
+}
+
+export interface DetectedEffortFamily {
+	baseId: string;
+	modelId: string;
+	effortModels: EffortModels;
+	sourceIds: string[];
+	kind: "tiered" | "thinking" | "sibling" | "preset";
+}
+
+const TIER_SUFFIX_RE = /^(.+)-(low|medium|high)$/i;
+const THINKING_SUFFIX_RE = /^(.+)-thinking$/i;
+
+export function detectSmartEffortFamilies(modelIds: readonly string[], providerName?: string): DetectedEffortFamily[] {
+	const cleaned: string[] = [];
+	const exactByLower = new Map<string, string>();
+	for (const raw of modelIds) {
+		let id = (raw ?? "").trim();
+		if (!id || id === "*" || id.startsWith("regex:")) continue;
+		const slashIdx = id.indexOf("/");
+		if (slashIdx > 0 && slashIdx < id.length - 1) {
+			const prefix = id.slice(0, slashIdx).toLowerCase();
+			if (prefix === "antigravity" || prefix === "codex" || prefix === "claude" || prefix === "grok") {
+				id = id.slice(slashIdx + 1);
+			}
+		}
+		const lower = id.toLowerCase();
+		if (!exactByLower.has(lower)) {
+			exactByLower.set(lower, id);
+			cleaned.push(id);
+		}
+	}
+
+	const families = new Map<
+		string,
+		{
+			baseId: string;
+			low?: string;
+			medium?: string;
+			high?: string;
+			thinking?: string;
+			sourceIds: Set<string>;
+		}
+	>();
+
+	const getOrCreate = (baseId: string) => {
+		const lower = baseId.toLowerCase();
+		let entry = families.get(lower);
+		if (!entry) {
+			entry = { baseId, sourceIds: new Set<string>() };
+			families.set(lower, entry);
+		}
+		return entry;
+	};
+
+	for (const id of cleaned) {
+		const tierMatch = TIER_SUFFIX_RE.exec(id);
+		if (tierMatch) {
+			const baseId = tierMatch[1]!;
+			const tier = tierMatch[2]!.toLowerCase() as "low" | "medium" | "high";
+			const entry = getOrCreate(baseId);
+			entry[tier] = id;
+			entry.sourceIds.add(id);
+			const tieredVariant = exactByLower.get(`${baseId.toLowerCase()}-tiered`);
+			if (tieredVariant) {
+				entry.sourceIds.add(tieredVariant);
+			}
+			continue;
+		}
+		const thinkingMatch = THINKING_SUFFIX_RE.exec(id);
+		if (thinkingMatch) {
+			const baseId = thinkingMatch[1]!;
+			const entry = getOrCreate(baseId);
+			entry.thinking = id;
+			entry.sourceIds.add(id);
+		}
+	}
+
+	const firstNonEmpty = (...vals: (string | undefined)[]): string => {
+		for (const v of vals) {
+			if (v && v.trim()) return v.trim();
+		}
+		return "";
+	};
+
+	const results: DetectedEffortFamily[] = [];
+	for (const [, entry] of families.entries()) {
+		const standaloneBase = exactByLower.get(entry.baseId.toLowerCase());
+		const tierCount = [entry.low, entry.medium, entry.high].filter(Boolean).length;
+		if (tierCount === 0 && !entry.thinking) continue;
+		if (tierCount === 1 && !entry.thinking && standaloneBase) continue;
+
+		const low = firstNonEmpty(entry.low, standaloneBase, entry.medium, entry.high, entry.thinking);
+		const medium = firstNonEmpty(entry.medium, entry.thinking, entry.high, entry.low, standaloneBase);
+		const high = firstNonEmpty(entry.high, entry.thinking, entry.medium, entry.low, standaloneBase);
+		const defaultTier = entry.medium || entry.thinking ? "medium" : entry.high ? "high" : "low";
+		const defaultModel = defaultTier === "medium" ? medium : defaultTier === "high" ? high : low;
+		if (!defaultModel) continue;
+
+		const canonicalBase = standaloneBase ?? entry.baseId;
+		results.push({
+			baseId: canonicalBase,
+			modelId: defaultModel,
+			effortModels: {
+				low,
+				medium,
+				high,
+				default: defaultTier,
+			},
+			sourceIds: [...entry.sourceIds],
+			kind: tierCount >= 2 ? "tiered" : entry.thinking ? "thinking" : "tiered",
+		});
+	}
+
+	results.sort((a, b) => a.baseId.toLowerCase().localeCompare(b.baseId.toLowerCase()));
+	if (results.length > 0) {
+		return results;
+	}
+
+	// Fallback when no tier/thinking suffixes exist in the model list
+	const p = (providerName ?? "").toLowerCase().trim();
+	if (p === "codex" || p === "openai") {
+		const codexBase =
+			exactByLower.get("gpt-5.3-codex") ??
+			cleaned.find((m) => m.toLowerCase().includes("codex")) ??
+			cleaned.find((m) => m.toLowerCase().startsWith("gpt-5")) ??
+			"gpt-5.3-codex";
+		return [
+			{
+				baseId: codexBase,
+				modelId: codexBase,
+				effortModels: { low: codexBase, medium: codexBase, high: codexBase, default: "medium" },
+				sourceIds: [],
+				kind: "preset",
+			},
+		];
+	}
+	if (p === "claude" || p === "anthropic") {
+		const opus = exactByLower.get("claude-opus-4-6") ?? "claude-opus-4-6";
+		const sonnet = exactByLower.get("claude-sonnet-4-6") ?? opus;
+		return [
+			{
+				baseId: opus,
+				modelId: opus,
+				effortModels: { low: sonnet, medium: opus, high: opus, default: "medium" },
+				sourceIds: [],
+				kind: "sibling",
+			},
+		];
+	}
+	if (p === "grok" || p === "xai") {
+		const grokBase = exactByLower.get("grok-4") ?? cleaned.find((m) => m.toLowerCase().startsWith("grok-4")) ?? "grok-4";
+		const grokLow = exactByLower.get("grok-3-mini") ?? grokBase;
+		const grokHigh = exactByLower.get("grok-4-heavy") ?? grokBase;
+		return [
+			{
+				baseId: grokBase,
+				modelId: grokBase,
+				effortModels: { low: grokLow, medium: grokBase, high: grokHigh, default: "medium" },
+				sourceIds: [],
+				kind: "sibling",
+			},
+		];
+	}
+	return [];
+}
+
+function EffortFusionSection({
+	aliasName,
+	config,
+	onChange,
+	providerName,
+	disabled,
+}: {
+	aliasName?: string;
+	config: AliasConfig;
+	onChange: (patch: Partial<AliasConfig>) => void;
+	providerName: string;
+	disabled?: boolean;
+}) {
+	const effort = config.effort_models ?? {};
+	const hasEffort = hasEffortModelsConfigured(effort);
+	const displayAlias = aliasName?.trim() || "model-alias";
+
+	const updateTier = (tier: keyof EffortModels, val: string) => {
+		const nextEffort = cleanEffortModels({ ...effort, [tier]: val });
+		const patch: Partial<AliasConfig> = { effort_models: nextEffort };
+		if (!config.model_id?.trim() && val.trim()) {
+			patch.model_id = val.trim();
+		}
+		onChange(patch);
+	};
+
+	const fillFromMainModel = () => {
+		const base = config.model_id?.trim() || effort.default || effort.high || effort.medium || effort.low || "";
+		if (!base) return;
+		onChange({
+			model_id: base,
+			effort_models: {
+				low: base,
+				medium: base,
+				high: base,
+				default: base,
+			},
+		});
+	};
+
+	return (
+		<div className="bg-muted/20 space-y-3.5 rounded-lg border p-3.5">
+			<div className="flex flex-wrap items-start justify-between gap-2 border-b pb-2.5">
+				<div className="space-y-0.5">
+					<div className="flex items-center gap-2">
+						<Layers className="text-primary h-4 w-4" />
+						<h4 className="text-sm font-semibold">Effort 双向融合路由 (Mode A 档位聚合 + Mode B 虚拟后缀)</h4>
+						{hasEffort && (
+							<Badge variant="default" className="text-[10px]">
+								已激活融合
+							</Badge>
+						)}
+					</div>
+					<p className="text-muted-foreground text-xs">
+						Mode A：根据请求的 <code>reasoning.effort</code> 或 <code>reasoning.max_tokens</code> 自动路由至对应档位上游模型；Mode B：直接请求{" "}
+						<code>{displayAlias}-low/medium/high/max</code> 时自动剥离后缀并注入对应推理强度。
+					</p>
+				</div>
+				<div className="flex items-center gap-1.5">
+					{config.model_id?.trim() && (
+						<Button
+							type="button"
+							variant="outline"
+							size="sm"
+							className="h-7 gap-1 text-xs"
+							disabled={disabled}
+							onClick={fillFromMainModel}
+						>
+							<Wand2 className="h-3 w-3" />
+							用主模型填充三档
+						</Button>
+					)}
+					{hasEffort && (
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							className="text-muted-foreground hover:text-destructive h-7 text-xs"
+							disabled={disabled}
+							onClick={() => onChange({ effort_models: undefined })}
+						>
+							清空档位
+						</Button>
+					)}
+				</div>
+			</div>
+
+			<div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+				<FieldRow
+					label="Low 档位模型 (low / minimal)"
+					hint="当 effort 为 low/minimal 或思维预算 <= 4096 tokens 时路由"
+				>
+					<ModelSelector
+						provider={providerName}
+						value={effort.low ?? ""}
+						onChange={(v) => updateTier("low", v)}
+						placeholder="选择或输入 Low 档位上游模型 ID"
+						disabled={disabled}
+						unfiltered
+						allowCustomModel
+						data-testid={`deployment-effort-low-${displayAlias}`}
+					/>
+				</FieldRow>
+				<FieldRow
+					label="Medium 档位模型 (medium)"
+					hint="当 effort 为 medium 或思维预算 <= 16384 tokens 时路由"
+				>
+					<ModelSelector
+						provider={providerName}
+						value={effort.medium ?? ""}
+						onChange={(v) => updateTier("medium", v)}
+						placeholder="选择或输入 Medium 档位上游模型 ID"
+						disabled={disabled}
+						unfiltered
+						allowCustomModel
+						data-testid={`deployment-effort-medium-${displayAlias}`}
+					/>
+				</FieldRow>
+				<FieldRow
+					label="High 档位模型 (high / xhigh / max)"
+					hint="当 effort 为 high/xhigh/max 或大预算深度思考时路由"
+				>
+					<ModelSelector
+						provider={providerName}
+						value={effort.high ?? ""}
+						onChange={(v) => updateTier("high", v)}
+						placeholder="选择或输入 High 档位上游模型 ID"
+						disabled={disabled}
+						unfiltered
+						allowCustomModel
+						data-testid={`deployment-effort-high-${displayAlias}`}
+					/>
+				</FieldRow>
+				<FieldRow
+					label="Default 默认回退模型 (可选)"
+					hint="未显式指定 effort 时的回退模型（留空则使用主 Model ID 或 High -> Medium -> Low）"
+				>
+					<ModelSelector
+						provider={providerName}
+						value={effort.default ?? ""}
+						onChange={(v) => updateTier("default", v)}
+						placeholder={config.model_id || "留空则回退至主 Model ID"}
+						disabled={disabled}
+						unfiltered
+						allowCustomModel
+						data-testid={`deployment-effort-default-${displayAlias}`}
+					/>
+				</FieldRow>
+			</div>
+
+			<div className="bg-background/70 flex flex-wrap items-center gap-1.5 rounded-md border px-2.5 py-2 text-xs">
+				<span className="text-muted-foreground font-medium">无感虚拟调用入口 (Mode A + B)：</span>
+				<Badge variant="secondary" className="font-mono text-[11px]">
+					{displayAlias}
+				</Badge>
+				{EFFORT_SUFFIXES.map((sfx) => (
+					<Badge key={sfx} variant="outline" className="font-mono text-[11px]">
+						{displayAlias}
+						{sfx}
+					</Badge>
+				))}
+			</div>
+		</div>
+	);
+}
+
 function ExpandedConfigPanel({
+	aliasName,
 	config,
 	onChange,
 	providerName,
 	disabled,
 	isPattern,
 }: {
+	aliasName?: string;
 	config: AliasConfig;
 	onChange: (patch: Partial<AliasConfig>) => void;
 	providerName: string;
@@ -547,6 +895,13 @@ function ExpandedConfigPanel({
 	const { t } = useTranslation("models");
 	return (
 		<div className="space-y-6 border-t p-4">
+			<EffortFusionSection
+				aliasName={aliasName}
+				config={config}
+				onChange={onChange}
+				providerName={providerName}
+				disabled={disabled}
+			/>
 			<div className="space-y-4">
 				<FieldRow
 					label={t("providers.deployments.canonicalModelName")}
@@ -598,11 +953,47 @@ function ExpandedConfigPanel({
 	);
 }
 
-export function DeploymentsTable({ value, onChange, providerName, disabled = false }: Props) {
+export function DeploymentsTable({
+	value,
+	onChange,
+	providerName,
+	availableModels,
+	onCleanSourceModels,
+	disabled = false,
+}: Props) {
 	const { t } = useTranslation("models");
 	const { t: tc } = useTranslation("common");
 	const normalized = useMemo(() => normalize(value), [value]);
 	const rows: Row[] = useMemo(() => Object.entries(normalized).map(([name, config]) => ({ name, config })), [normalized]);
+
+	const { data: catalogModelsData } = useGetModelsQuery(
+		{
+			provider: providerName || undefined,
+			limit: 500,
+			unfiltered: true,
+		},
+		{ skip: !providerName },
+	);
+
+	const candidateModelIds = useMemo(() => {
+		const merged: string[] = [];
+		if (catalogModelsData?.models) {
+			for (const m of catalogModelsData.models) {
+				if (m.name) merged.push(m.name);
+			}
+		}
+		if (availableModels) {
+			for (const m of availableModels) {
+				if (m && m !== "*") merged.push(m);
+			}
+		}
+		return merged;
+	}, [catalogModelsData?.models, availableModels]);
+
+	const detectedFamilies = useMemo(
+		() => detectSmartEffortFamilies(candidateModelIds, providerName),
+		[candidateModelIds, providerName],
+	);
 
 	// Stable per-row id keyed by current deployment name. Survives rename so
 	// expanded/pendingNames state stays attached to the same row, and gives
@@ -690,7 +1081,70 @@ export function DeploymentsTable({ value, onChange, providerName, disabled = fal
 	};
 
 	const patchDraftConfig = (patch: Partial<AliasConfig>) => {
-		setDraftRow((r) => ({ ...r, config: { ...r.config, ...patch } }));
+		setDraftRow((r) => {
+			const next = { ...r, config: { ...r.config, ...patch } };
+			if (next.name.trim() && (next.config.model_id.trim() || hasEffortModelsConfigured(next.config.effort_models))) {
+				setTimeout(() => commitDraftIfReady(next), 0);
+			}
+			return next;
+		});
+	};
+
+	const applyEffortPreset = () => {
+		const sourceSet = new Set<string>();
+		const baseIds: string[] = [];
+		for (const fam of detectedFamilies) {
+			baseIds.push(fam.baseId);
+			for (const src of fam.sourceIds) {
+				if (src.toLowerCase() !== fam.baseId.toLowerCase()) {
+					sourceSet.add(src);
+				}
+			}
+		}
+
+		// Filter out any un-fused raw tier rows if the user had added them into deployments
+		// (or outdated antigravity gemini-2.5-pro preset)
+		const pLower = providerName.toLowerCase().trim();
+		const nextRows = rows.filter((r) => {
+			const nameLower = r.name.trim().toLowerCase();
+			if (pLower === "antigravity" && nameLower === "gemini-2.5-pro") {
+				return false;
+			}
+			if (
+				!hasEffortModelsConfigured(r.config.effort_models) &&
+				Array.from(sourceSet).some((s) => s.toLowerCase() === nameLower)
+			) {
+				return false;
+			}
+			return true;
+		});
+
+		const nextExpanded = new Set(expanded);
+		for (const fam of detectedFamilies) {
+			const presetCfg: AliasConfig = {
+				model_id: fam.modelId,
+				effort_models: fam.effortModels,
+			};
+			const existingIdx = nextRows.findIndex((r) => r.name.trim().toLowerCase() === fam.baseId.toLowerCase());
+			if (existingIdx >= 0) {
+				const existing = nextRows[existingIdx]!;
+				nextRows[existingIdx] = {
+					...existing,
+					config: {
+						...existing.config,
+						model_id: fam.modelId,
+						effort_models: fam.effortModels,
+					},
+				};
+			} else {
+				nextRows.push({ name: fam.baseId, config: presetCfg });
+			}
+		}
+		emit(nextRows);
+		setExpanded(nextExpanded);
+		if (onCleanSourceModels && sourceSet.size > 0) {
+			onCleanSourceModels([...sourceSet], baseIds);
+		}
 	};
 
 	// Commit the in-progress draft row into the committed list. Called from
@@ -701,10 +1155,18 @@ export function DeploymentsTable({ value, onChange, providerName, disabled = fal
 		const candidate = override ?? draftRow;
 		const name = candidate.name.trim();
 		const modelId = candidate.config.model_id.trim();
-		if (!name || !modelId) return;
+		const hasEffort = hasEffortModelsConfigured(candidate.config.effort_models);
+		if (!name || (!modelId && !hasEffort)) return;
 		const exists = Object.keys(normalized).some((k) => k.trim().toLowerCase() === name.toLowerCase());
 		if (exists) return;
-		emit([...rows, { name, config: { ...candidate.config, model_id: modelId } }]);
+		const resolvedModelId =
+			modelId ||
+			candidate.config.effort_models?.default ||
+			candidate.config.effort_models?.high ||
+			candidate.config.effort_models?.medium ||
+			candidate.config.effort_models?.low ||
+			"";
+		emit([...rows, { name, config: { ...candidate.config, model_id: resolvedModelId } }]);
 		setDraftRow({ name: "", config: { model_id: "" } });
 		setDraftExpanded(false);
 	};
@@ -723,156 +1185,220 @@ export function DeploymentsTable({ value, onChange, providerName, disabled = fal
 	};
 
 	return (
-		<div className="overflow-hidden rounded-md border">
-			<div className="bg-muted/50 text-foreground grid h-10 grid-cols-[28px_minmax(0,1fr)_minmax(0,1fr)_28px] items-center gap-2 border-b px-4 text-sm font-medium">
-				<div />
-				<div>{t("providers.deployments.deploymentName")}</div>
-				<div>{t("providers.deployments.modelId")}</div>
-				<span className="sr-only">{tc("actions")}</span>
+		<div className="space-y-2">
+			<div className="bg-muted/30 flex flex-col gap-2 rounded-md border px-3 py-2.5 text-xs">
+				<div className="flex flex-wrap items-center justify-between gap-2">
+					<div className="flex flex-wrap items-center gap-1.5">
+						<Badge variant="outline" className="gap-1 text-[10px]">
+							<Sparkles className="h-3 w-3" />
+							智能 Effort 融合已开启 (Mode A + B)
+						</Badge>
+						<span className="text-muted-foreground">
+							支持零配置自动识别渠道 <code>-low/-medium/-high/-thinking</code> 模型系列，以及直接附加{" "}
+							<code>-minimal/-low/-medium/-high/-xhigh/-max</code> 虚拟后缀无感调用。
+						</span>
+					</div>
+					{detectedFamilies.length > 0 && (
+						<Button
+							type="button"
+							variant="outline"
+							size="sm"
+							className="h-7 gap-1.5 text-xs"
+							disabled={disabled}
+							onClick={applyEffortPreset}
+							data-testid="deployment-apply-effort-preset"
+						>
+							<Wand2 className="h-3.5 w-3.5" />
+							智能识别并融合 ({detectedFamilies.length} 组)
+						</Button>
+					)}
+				</div>
+				{detectedFamilies.length > 0 && (
+					<div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+						<span className="text-muted-foreground text-[11px]">从当前渠道模型列表智能识别到的融合系列：</span>
+						{detectedFamilies.map((fam) => {
+							const isApplied = rows.some(
+								(r) =>
+									r.name.trim().toLowerCase() === fam.baseId.toLowerCase() &&
+									hasEffortModelsConfigured(r.config.effort_models),
+							);
+							return (
+								<Badge
+									key={fam.baseId}
+									variant={isApplied ? "secondary" : "outline"}
+									className="font-mono text-[10px]"
+									title={`Low: ${fam.effortModels.low} | Medium: ${fam.effortModels.medium} | High: ${fam.effortModels.high}`}
+								>
+									{fam.baseId}
+									{isApplied ? " ✓" : ""}
+								</Badge>
+							);
+						})}
+					</div>
+				)}
 			</div>
-			<div className="divide-y">
-				{rowsWithIds.map((row) => {
-					const isOpen = expanded.has(row.rowId);
-					const pending = pendingNames[row.rowId];
-					const isPattern = isRegexEntry(row.name);
-					const patternError = pending === undefined ? validatePatternAlias(row.name, row.config.model_id, row.config.model_name) : null;
-					return (
-						<Collapsible key={row.rowId} open={isOpen} onOpenChange={() => toggleExpanded(row.rowId)}>
-							<div className={cn(isOpen && "bg-muted/20")}>
-								<div className="grid grid-cols-[28px_minmax(0,1fr)_minmax(0,1fr)_28px] items-center gap-2 px-2 py-1.5">
-									<CollapsibleTrigger asChild>
+			<div className="overflow-hidden rounded-md border">
+				<div className="bg-muted/50 text-foreground grid h-10 grid-cols-[28px_minmax(0,1fr)_minmax(0,1fr)_28px] items-center gap-2 border-b px-4 text-sm font-medium">
+					<div />
+					<div>{t("providers.deployments.deploymentName")}</div>
+					<div>{t("providers.deployments.modelId")}</div>
+					<span className="sr-only">{tc("actions")}</span>
+				</div>
+				<div className="divide-y">
+					{rowsWithIds.map((row) => {
+						const isOpen = expanded.has(row.rowId);
+						const pending = pendingNames[row.rowId];
+						const isPattern = isRegexEntry(row.name);
+						const patternError = pending === undefined ? validatePatternAlias(row.name, row.config.model_id, row.config.model_name) : null;
+						const rowHasEffort = hasEffortModelsConfigured(row.config.effort_models);
+						return (
+							<Collapsible key={row.rowId} open={isOpen} onOpenChange={() => toggleExpanded(row.rowId)}>
+								<div className={cn(isOpen && "bg-muted/20")}>
+									<div className="grid grid-cols-[28px_minmax(0,1fr)_minmax(0,1fr)_28px] items-center gap-2 px-2 py-1.5">
+										<CollapsibleTrigger asChild>
+											<Button
+												variant="ghost"
+												size="icon"
+												className="h-7 w-7"
+												disabled={disabled}
+												data-testid={`deployment-expand-${row.name}`}
+											>
+												{isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+											</Button>
+										</CollapsibleTrigger>
+										<div className="space-y-1">
+											<div className="flex items-center gap-1.5">
+												<div className="relative flex-1">
+													<Input
+														value={pending ?? row.name}
+														onChange={(e) => renameRow(row.rowId, row.name, e.target.value)}
+														placeholder={t("providers.deployments.requestModelName")}
+														disabled={disabled}
+														className={cn(isPattern && "pr-11")}
+														data-testid={`deployment-name-${row.name}`}
+													/>
+													{isPattern && <PatternMark testId={`deployment-pattern-${row.name}`} />}
+												</div>
+												{rowHasEffort && (
+													<Badge variant="secondary" className="shrink-0 gap-1 text-[10px]" title="已启用 Mode A 档位聚合与 Mode B 虚拟后缀路由">
+														<Layers className="h-2.5 w-2.5" />
+														Effort 融合
+													</Badge>
+												)}
+											</div>
+											{pending !== undefined && (
+												<p className="text-destructive text-xs">
+													{pending.trim() === "" ? t("providers.deployments.nameEmpty") : t("providers.deployments.nameExists")}
+												</p>
+											)}
+											{patternError && (
+												<p className="text-destructive text-xs" data-testid={`deployment-pattern-error-${row.name}`}>
+													{patternError}
+												</p>
+											)}
+										</div>
+										<ModelSelector
+											provider={providerName}
+											value={row.config.model_id}
+											onChange={(v) => patchConfig(row.name, { model_id: v })}
+											placeholder={rowHasEffort ? "由 Effort 档位映射接管 (可选默认模型)" : t("providers.deployments.deploymentProfileId")}
+											disabled={disabled}
+											unfiltered
+											allowCustomModel
+											data-testid={`deployment-model-${row.name}`}
+										/>
 										<Button
+											type="button"
 											variant="ghost"
 											size="icon"
-											className="h-7 w-7"
+											className="text-muted-foreground hover:text-destructive h-7 w-7"
+											onClick={() => removeRow(row.rowId, row.name)}
 											disabled={disabled}
-											data-testid={`deployment-expand-${row.name}`}
+											data-testid={`deployment-delete-${row.name}`}
 										>
-											{isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+											<Trash className="h-4 w-4" />
 										</Button>
-									</CollapsibleTrigger>
-									<div className="space-y-1">
-										<div className="relative">
-											<Input
-												value={pending ?? row.name}
-												onChange={(e) => renameRow(row.rowId, row.name, e.target.value)}
-												placeholder={t("providers.deployments.requestModelName")}
-												disabled={disabled}
-												className={cn(isPattern && "pr-11")}
-												data-testid={`deployment-name-${row.name}`}
-											/>
-											{isPattern && <PatternMark testId={`deployment-pattern-${row.name}`} />}
-										</div>
-										{pending !== undefined && (
-											<p className="text-destructive text-xs">
-												{pending.trim() === "" ? t("providers.deployments.nameEmpty") : t("providers.deployments.nameExists")}
-											</p>
-										)}
-										{patternError && (
-											<p className="text-destructive text-xs" data-testid={`deployment-pattern-error-${row.name}`}>
-												{patternError}
-											</p>
-										)}
 									</div>
-									<ModelSelector
-										provider={providerName}
-										value={row.config.model_id}
-										onChange={(v) => patchConfig(row.name, { model_id: v })}
-										placeholder={t("providers.deployments.deploymentProfileId")}
-										disabled={disabled}
-										unfiltered
-										allowCustomModel
-										data-testid={`deployment-model-${row.name}`}
-									/>
-									<Button
-										type="button"
-										variant="ghost"
-										size="icon"
-										className="text-muted-foreground hover:text-destructive h-7 w-7"
-										onClick={() => removeRow(row.rowId, row.name)}
-										disabled={disabled}
-										data-testid={`deployment-delete-${row.name}`}
-									>
-										<Trash className="h-4 w-4" />
-									</Button>
+									<CollapsibleContent>
+										<ExpandedConfigPanel
+											aliasName={row.name}
+											config={row.config}
+											onChange={(patch) => patchConfig(row.name, patch)}
+											providerName={providerName}
+											disabled={disabled}
+											isPattern={isPattern}
+										/>
+									</CollapsibleContent>
 								</div>
-								<CollapsibleContent>
-									<ExpandedConfigPanel
-										config={row.config}
-										onChange={(patch) => patchConfig(row.name, patch)}
-										providerName={providerName}
+							</Collapsible>
+						);
+					})}
+					<Collapsible open={draftExpanded} onOpenChange={setDraftExpanded}>
+						<div className={cn(draftExpanded && "bg-muted/20")}>
+							<div className="grid grid-cols-[28px_minmax(0,1fr)_minmax(0,1fr)_28px] items-center gap-2 px-2 py-1.5">
+								<CollapsibleTrigger asChild>
+									<Button variant="ghost" size="icon" className="h-7 w-7" disabled={disabled} data-testid="draft-deployment-expand">
+										{draftExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+									</Button>
+								</CollapsibleTrigger>
+								<div className="relative">
+									<Input
+										value={draftRow.name}
+										onChange={(e) => setDraftRow((r) => ({ ...r, name: e.target.value }))}
+										onBlur={() => commitDraftIfReady()}
+										onKeyDown={(e) => {
+											if (e.key === "Enter") {
+												e.preventDefault();
+												commitDraftIfReady();
+											}
+										}}
+										placeholder={t("providers.deployments.requestModelName")}
 										disabled={disabled}
-										isPattern={isPattern}
+										className={cn(isRegexEntry(draftRow.name.trim()) && "pr-11")}
+										data-testid="draft-deployment-name"
 									/>
-								</CollapsibleContent>
-							</div>
-						</Collapsible>
-					);
-				})}
-				<Collapsible open={draftExpanded} onOpenChange={setDraftExpanded}>
-					<div className={cn(draftExpanded && "bg-muted/20")}>
-						<div className="grid grid-cols-[28px_minmax(0,1fr)_minmax(0,1fr)_28px] items-center gap-2 px-2 py-1.5">
-							<CollapsibleTrigger asChild>
-								<Button variant="ghost" size="icon" className="h-7 w-7" disabled={disabled} data-testid="draft-deployment-expand">
-									{draftExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-								</Button>
-							</CollapsibleTrigger>
-							<div className="relative">
-								<Input
-									value={draftRow.name}
-									onChange={(e) => setDraftRow((r) => ({ ...r, name: e.target.value }))}
-									onBlur={() => commitDraftIfReady()}
-									onKeyDown={(e) => {
-										if (e.key === "Enter") {
-											e.preventDefault();
-											commitDraftIfReady();
-										}
+									{isRegexEntry(draftRow.name.trim()) && <PatternMark testId="draft-deployment-pattern" />}
+								</div>
+								<ModelSelector
+									provider={providerName}
+									value={draftRow.config.model_id}
+									onChange={(modelId) => {
+										const nextDraft = { ...draftRow, config: { ...draftRow.config, model_id: modelId } };
+										setDraftRow(nextDraft);
+										commitDraftIfReady(nextDraft);
 									}}
-									placeholder={t("providers.deployments.requestModelName")}
+									placeholder={t("providers.deployments.deploymentProfileId")}
 									disabled={disabled}
-									className={cn(isRegexEntry(draftRow.name.trim()) && "pr-11")}
-									data-testid="draft-deployment-name"
+									unfiltered
+									allowCustomModel
+									data-testid="draft-deployment-model"
 								/>
-								{isRegexEntry(draftRow.name.trim()) && <PatternMark testId="draft-deployment-pattern" />}
+								<div />
 							</div>
-							<ModelSelector
-								provider={providerName}
-								value={draftRow.config.model_id}
-								onChange={(modelId) => {
-									const nextDraft = { ...draftRow, config: { ...draftRow.config, model_id: modelId } };
-									setDraftRow(nextDraft);
-									commitDraftIfReady(nextDraft);
-								}}
-								placeholder={t("providers.deployments.deploymentProfileId")}
-								disabled={disabled}
-								unfiltered
-								allowCustomModel
-								data-testid="draft-deployment-model"
-							/>
-							<div />
-						</div>
-						{draftPatternError && (
-							<p className="text-destructive px-4 pb-2 text-xs" data-testid="draft-deployment-pattern-error">
-								{draftPatternError}
-							</p>
-						)}
-						{(draftRow.name.trim() !== "" || draftRow.config.model_id.trim() !== "") &&
-							!(draftRow.name.trim() && draftRow.config.model_id.trim()) && (
-								<p className="text-muted-foreground px-4 pb-2 text-xs">{t("providers.deployments.draftIncomplete")}</p>
+							{draftPatternError && (
+								<p className="text-destructive px-4 pb-2 text-xs" data-testid="draft-deployment-pattern-error">
+									{draftPatternError}
+								</p>
 							)}
-						<CollapsibleContent>
-							<ExpandedConfigPanel
-								config={draftRow.config}
-								onChange={patchDraftConfig}
-								providerName={providerName}
-								disabled={disabled}
-								isPattern={isRegexEntry(draftRow.name.trim())}
-							/>
-						</CollapsibleContent>
-					</div>
-				</Collapsible>
+							{(draftRow.name.trim() !== "" || draftRow.config.model_id.trim() !== "") &&
+								!(draftRow.name.trim() && (draftRow.config.model_id.trim() || hasEffortModelsConfigured(draftRow.config.effort_models))) && (
+									<p className="text-muted-foreground px-4 pb-2 text-xs">{t("providers.deployments.draftIncomplete")}</p>
+								)}
+							<CollapsibleContent>
+								<ExpandedConfigPanel
+									aliasName={draftRow.name}
+									config={draftRow.config}
+									onChange={patchDraftConfig}
+									providerName={providerName}
+									disabled={disabled}
+									isPattern={isRegexEntry(draftRow.name.trim())}
+								/>
+							</CollapsibleContent>
+						</div>
+					</Collapsible>
+				</div>
+				<p className="text-muted-foreground border-t px-4 py-2 text-xs">{t("providers.deployments.patternHint")}</p>
 			</div>
-			<p className="text-muted-foreground border-t px-4 py-2 text-xs">{t("providers.deployments.patternHint")}</p>
 		</div>
 	);
 }

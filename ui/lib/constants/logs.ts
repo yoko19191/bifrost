@@ -41,6 +41,10 @@ export const KnownProvidersNames = [
 	"cloudflare",
 	"github-copilot",
 	"typesafe",
+	"antigravity",
+	"codex",
+	"claude",
+	"grok",
 ] as const;
 
 // Local Provider type derived from KNOWN_PROVIDERS constant
@@ -201,6 +205,10 @@ export const ProviderLabels: Record<ProviderName, string> = {
 	cloudflare: "Cloudflare",
 	"github-copilot": "GitHub Copilot",
 	typesafe: "TypeSafe",
+	antigravity: "Antigravity",
+	codex: "OpenAI Codex (OAuth)",
+	claude: "Claude (OAuth)",
+	grok: "xAI Grok (OAuth)",
 } as const;
 
 // Helper function to get provider label, supporting custom providers

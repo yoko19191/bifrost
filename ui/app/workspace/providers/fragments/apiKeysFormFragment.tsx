@@ -17,8 +17,9 @@ import { Info } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Control, UseFormReturn } from "react-hook-form";
 import { Trans, useTranslation } from "react-i18next";
-import { DeploymentsTable } from "./deploymentsTable";
+import { DeploymentsTable, detectSmartEffortFamilies } from "./deploymentsTable";
 import { GithubCopilotSignIn } from "./githubCopilotSignIn";
+import { isOAuthChannelProvider, OAuthChannelSignIn } from "./oauthChannelSignIn";
 
 // Providers that support batch APIs
 // Vertex authentication methods offered by the key form. The backend picks the mode from which
@@ -171,6 +172,7 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 	const isFireworks = effectiveProvider === "fireworks";
 	const isDatabricks = effectiveProvider === "databricks";
 	const isGithubCopilot = effectiveProvider === "github-copilot";
+	const isOAuthChannel = isOAuthChannelProvider(effectiveProvider);
 	const isCloudflare = effectiveProvider === "cloudflare";
 	// openai, and every custom provider built on the openai base, may mint its bearer from
 	// oauth_key_config instead of carrying a static API key.
@@ -439,7 +441,8 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 				!isDatabricks &&
 				!isOpenAICompatible &&
 				!isAnthropic &&
-				!isGithubCopilot && (
+				!isGithubCopilot &&
+				!isOAuthChannel && (
 					<FormField
 						control={control}
 						name={`key.value`}
@@ -456,6 +459,92 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 						)}
 					/>
 				)}
+			{isOAuthChannel && (
+				<div className="space-y-4 px-0.5">
+					<OAuthChannelSignIn
+						provider={effectiveProvider}
+						credentialValue={form.watch("key.value")?.value}
+						keyId={form.watch("key.id")}
+						keyName={form.watch("key.name")}
+						onCredentialResolved={(res) => {
+							form.setValue("key.value", { value: res.credential_json || "", ref: "" }, { shouldDirty: true, shouldValidate: true });
+							const currentName = (form.getValues("key.name") || "").trim();
+							if (!currentName) {
+								const suggestedName = res.email || res.account_id || res.project_id || `${effectiveProvider}-oauth`;
+								form.setValue("key.name", suggestedName, { shouldDirty: true, shouldValidate: true });
+							}
+							const candidateModels = res.models && res.models.length > 0 ? res.models : form.getValues("key.models");
+							if (candidateModels && candidateModels.length > 0) {
+								const families = detectSmartEffortFamilies(candidateModels, effectiveProvider);
+								if (families.length > 0) {
+									const currentAliases = { ...(form.getValues("key.aliases") || {}) };
+									for (const fam of families) {
+										currentAliases[fam.baseId] = {
+											...(currentAliases[fam.baseId] || {}),
+											model_id: fam.modelId,
+											effort_models: fam.effortModels,
+										};
+									}
+									form.setValue("key.aliases", currentAliases, { shouldDirty: true, shouldValidate: true });
+								}
+							}
+						}}
+						onApplyModels={(models) => {
+							const families = detectSmartEffortFamilies(models, effectiveProvider);
+							if (families.length > 0) {
+								const currentAliases = { ...(form.getValues("key.aliases") || {}) };
+								const sourceSet = new Set<string>();
+								for (const fam of families) {
+									currentAliases[fam.baseId] = {
+										...(currentAliases[fam.baseId] || {}),
+										model_id: fam.modelId,
+										effort_models: fam.effortModels,
+									};
+									for (const src of fam.sourceIds) {
+										if (src.toLowerCase() !== fam.baseId.toLowerCase()) {
+											sourceSet.add(src.toLowerCase());
+										}
+									}
+								}
+								form.setValue("key.aliases", currentAliases, { shouldDirty: true, shouldValidate: true });
+								const cleanedModels = models.filter((m) => !sourceSet.has(m.trim().toLowerCase()));
+								const seenLower = new Set(cleanedModels.map((m) => m.trim().toLowerCase()));
+								for (const fam of families) {
+									if (!seenLower.has(fam.baseId.toLowerCase())) {
+										cleanedModels.push(fam.baseId);
+										seenLower.add(fam.baseId.toLowerCase());
+									}
+								}
+								cleanedModels.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+								form.setValue("key.models", cleanedModels, { shouldDirty: true, shouldValidate: true });
+							} else {
+								form.setValue("key.models", models, { shouldDirty: true, shouldValidate: true });
+							}
+						}}
+					/>
+					<FormField
+						control={control}
+						name="key.value"
+						render={({ field }) => (
+							<FormItem>
+								<FormLabel>原始凭证 Payload / 环境变量 (key.value)</FormLabel>
+								<FormDescription>
+									完成上方 OAuth 授权或 JSON/Token 导入后会自动填充规范化 JSON 凭证，也支持直接绑定环境变量或手动修改。
+								</FormDescription>
+								<FormControl>
+									<SecretVarInput
+										data-testid="key-input-oauth-credential"
+										placeholder='{"type":"antigravity","access_token":"...","refresh_token":"..."} 或 env.MY_OAUTH_JSON'
+										type="text"
+										{...field}
+									/>
+								</FormControl>
+								<FormMessage />
+							</FormItem>
+						)}
+					/>
+				</div>
+			)}
 			<>
 				<FormField
 					control={control}
@@ -543,6 +632,23 @@ export function ApiKeyFormFragment({ control, providerName, baseProviderType, fo
 								<div data-testid="apikey-deployments-table">
 									<DeploymentsTable
 										providerName={providerName}
+										availableModels={form.watch("key.models")}
+										onCleanSourceModels={(sourceIdsToRemove, fusedBaseIdsToAdd) => {
+											const currentModels: string[] = form.getValues("key.models") || [];
+											if (currentModels.length === 0 || (currentModels.length === 1 && currentModels[0] === "*")) {
+												return;
+											}
+											const removeLower = new Set(sourceIdsToRemove.map((s) => s.toLowerCase()));
+											const nextModels = currentModels.filter((m) => !removeLower.has(m.trim().toLowerCase()));
+											const existingLower = new Set(nextModels.map((m) => m.trim().toLowerCase()));
+											for (const baseId of fusedBaseIdsToAdd) {
+												if (!existingLower.has(baseId.toLowerCase())) {
+													nextModels.push(baseId);
+													existingLower.add(baseId.toLowerCase());
+												}
+											}
+											form.setValue("key.models", nextModels, { shouldDirty: true, shouldValidate: true });
+										}}
 										value={field.value}
 										onChange={(next) => {
 											form.clearErrors("key.aliases");

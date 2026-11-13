@@ -1919,7 +1919,7 @@ setup-workspace: ## Set up Go workspace with all local modules for development
 	@$(ECHO) "$(YELLOW)Cleaning existing workspace...$(NC)"
 	@rm -f go.work go.work.sum || true
 	@$(ECHO) "$(YELLOW)Initializing new workspace...$(NC)"
-	@go work init ./cli ./core ./framework ./transports
+	@go work init ./cli ./core ./framework ./transports ./third_party/cpaembedded
 	@$(ECHO) "$(YELLOW)Adding plugin modules...$(NC)"
 	@for plugin_dir in ./plugins/*/; do \
 		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
