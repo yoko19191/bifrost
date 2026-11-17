@@ -100,12 +100,22 @@ func beginGrokDeviceAuthorization(ctx context.Context, options GrokOptions) (Gro
 	if expiresIn > xaiauth.MaxPollDuration {
 		expiresIn = xaiauth.MaxPollDuration
 	}
+	verifyURI := strings.TrimSpace(payload.VerificationURI)
+	if verifyURI == "" {
+		verifyURI = verificationURL
+	}
 	return GrokDeviceAuthorization{
 		VerificationURL: verificationURL,
 		UserCode:        strings.TrimSpace(payload.UserCode),
 		State: GrokDeviceState{
-			DeviceCode: strings.TrimSpace(payload.DeviceCode), TokenEndpoint: discovery.TokenEndpoint,
-			UserInfoEndpoint: discovery.UserInfoEndpoint, PollIntervalSeconds: int(interval / time.Second),
+			DeviceCode:              strings.TrimSpace(payload.DeviceCode),
+			TokenEndpoint:           discovery.TokenEndpoint,
+			UserInfoEndpoint:        discovery.UserInfoEndpoint,
+			PollIntervalSeconds:     int(interval / time.Second),
+			VerificationURI:         verifyURI,
+			VerificationURIComplete: verificationURL,
+			UserCode:                strings.TrimSpace(payload.UserCode),
+			IntervalSeconds:         int(interval / time.Second),
 		},
 		ExpiresAt: grokNow(options).Add(expiresIn), PollInterval: interval,
 	}, nil

@@ -370,6 +370,11 @@ export interface OAuthStartResponse {
 	state?: string;
 	verifier?: string;
 	redirect_uri?: string;
+	verification_uri?: string;
+	verification_uri_complete?: string;
+	user_code?: string;
+	expires_in?: number;
+	interval?: number;
 	device_state?: OAuthDeviceState;
 }
 

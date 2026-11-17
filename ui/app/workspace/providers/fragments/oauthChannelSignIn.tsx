@@ -243,7 +243,15 @@ export function OAuthChannelSignIn({
 				window.open(session.auth_url, "_blank", "noopener,noreferrer");
 				pollBrowserFlow(session, 2);
 			} else if (session.flow_type === "device" && session.device_state) {
-				pollDeviceFlow(session, session.device_state.interval_seconds || 5);
+				const verifyUrl =
+					session.verification_uri_complete ||
+					session.verification_uri ||
+					session.device_state.verification_uri_complete ||
+					session.device_state.verification_uri;
+				if (verifyUrl) {
+					window.open(verifyUrl, "_blank", "noopener,noreferrer");
+				}
+				pollDeviceFlow(session, session.interval || session.device_state.interval_seconds || 5);
 			}
 		} catch (err) {
 			if (gen !== generationRef.current) return;
@@ -486,25 +494,32 @@ export function OAuthChannelSignIn({
 									<p className="font-medium">
 										1. Open{" "}
 										<a
-											href={flowSession.device_state?.verification_uri_complete || flowSession.device_state?.verification_uri}
+											href={
+												flowSession.verification_uri_complete ||
+												flowSession.verification_uri ||
+												flowSession.device_state?.verification_uri_complete ||
+												flowSession.device_state?.verification_uri
+											}
 											target="_blank"
 											rel="noopener noreferrer"
 											className="text-primary inline-flex items-center gap-1 underline"
 										>
-											{flowSession.device_state?.verification_uri}
+											{flowSession.verification_uri ||
+												flowSession.verification_uri_complete ||
+												flowSession.device_state?.verification_uri}
 											<ExternalLink className="h-3 w-3" />
 										</a>
 									</p>
 									<div className="flex items-center gap-2">
 										<span>2. Enter device code:</span>
 										<code className="bg-muted rounded px-2 py-0.5 font-mono text-base font-semibold">
-											{flowSession.device_state?.user_code}
+											{flowSession.user_code || flowSession.device_state?.user_code}
 										</code>
 										<Button
 											type="button"
 											variant="ghost"
 											size="sm"
-											onClick={() => copy(flowSession.device_state?.user_code || "")}
+											onClick={() => copy(flowSession.user_code || flowSession.device_state?.user_code || "")}
 										>
 											{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
 										</Button>

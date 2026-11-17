@@ -43,10 +43,14 @@ type GrokOptions struct {
 }
 
 type GrokDeviceState struct {
-	DeviceCode          string `json:"device_code"`
-	TokenEndpoint       string `json:"token_endpoint"`
-	UserInfoEndpoint    string `json:"userinfo_endpoint"`
-	PollIntervalSeconds int    `json:"poll_interval_seconds"`
+	DeviceCode              string `json:"device_code"`
+	TokenEndpoint           string `json:"token_endpoint"`
+	UserInfoEndpoint        string `json:"userinfo_endpoint"`
+	PollIntervalSeconds     int    `json:"poll_interval_seconds"`
+	VerificationURI         string `json:"verification_uri,omitempty"`
+	VerificationURIComplete string `json:"verification_uri_complete,omitempty"`
+	UserCode                string `json:"user_code,omitempty"`
+	IntervalSeconds         int    `json:"interval_seconds,omitempty"`
 }
 
 type GrokDeviceAuthorization struct {
