@@ -2088,8 +2088,8 @@ func (s *RDBConfigStore) GetMCPLibraryPaginated(ctx context.Context, params MCPL
 	if strings.EqualFold(params.Order, "desc") {
 		dir = "DESC"
 	}
-	// id as a stable tiebreaker so paging is deterministic across equal keys.
-	orderClause := fmt.Sprintf("%s %s, id ASC", sortColumn, dir)
+	// Put built-in Scientific Discovery entries first, then sortColumn + id as a stable tiebreaker.
+	orderClause := fmt.Sprintf("CASE WHEN category = 'Scientific Discovery' THEN 0 ELSE 1 END ASC, %s %s, id ASC", sortColumn, dir)
 
 	var entries []tables.TableMCPLibrary
 	if err := baseQuery.

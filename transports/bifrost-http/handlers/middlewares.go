@@ -1433,14 +1433,14 @@ func virtualKeyFromHeaders(ctx *fasthttp.RequestCtx) string {
 	authHeader := strings.TrimSpace(string(ctx.Request.Header.Peek("Authorization")))
 	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
 		token := strings.TrimSpace(authHeader[7:])
-		if token != "" && strings.HasPrefix(strings.ToLower(token), governance.VirtualKeyPrefix) {
+		if token != "" && governance.HasVirtualKeyPrefix(token) {
 			return token
 		}
 	}
 
 	for _, header := range []string{"x-api-key", "x-goog-api-key", "api-key"} {
 		if apiKey := strings.TrimSpace(string(ctx.Request.Header.Peek(header))); apiKey != "" {
-			if strings.HasPrefix(strings.ToLower(apiKey), governance.VirtualKeyPrefix) {
+			if governance.HasVirtualKeyPrefix(apiKey) {
 				return apiKey
 			}
 		}

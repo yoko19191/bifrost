@@ -414,6 +414,7 @@ export interface CreateMCPClientRequest {
 	name: string;
 	endpoint_slug?: string; // Optional on create (derived from name when blank); immutable after
 	is_code_mode_client?: boolean;
+	allow_by_default?: boolean;
 	connection_type: MCPConnectionType;
 	connection_string?: SecretVar;
 	stdio_config?: MCPStdioConfig;
@@ -582,6 +583,8 @@ export interface MCPLibraryEntry {
 	source?: "remote" | "custom";
 	/** True when an existing MCP client was installed from this entry (computed server-side). */
 	installed?: boolean;
+	installed_endpoint_slug?: string;
+	installed_client_id?: string;
 	created_at: string;
 	updated_at: string;
 }

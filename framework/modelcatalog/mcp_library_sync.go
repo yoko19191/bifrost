@@ -254,13 +254,22 @@ func (mc *ModelCatalog) syncMCPLibraryNow(ctx context.Context) (int, error) {
 	if mc.configStore == nil {
 		return 0, nil
 	}
+	sciCount, sciErr := SeedBuiltinScientificMCPLibrary(ctx, mc.configStore)
+	if sciErr != nil {
+		mc.logger.Warn("failed to seed built-in scientific MCP library entries: %v", sciErr)
+	}
 	url := mc.getMCPLibraryURL()
 	count, err := SyncMCPLibrary(ctx, url, mc.configStore)
 	if err != nil {
+		if sciCount > 0 {
+			mc.logger.Warn("remote MCP library sync failed (%v), keeping %d built-in scientific entries", err, sciCount)
+			return sciCount, nil
+		}
 		return 0, err
 	}
-	mc.logger.Info("MCP library sync completed: %d entries synced from %s", count, url)
-	return count, nil
+	total := count + sciCount
+	mc.logger.Info("MCP library sync completed: %d entries synced (%d scientific built-in, %d from %s)", total, sciCount, count, url)
+	return total, nil
 }
 
 // getMCPLibraryURL returns a copy of the MCP library URL under mutex protection.

@@ -6,7 +6,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { getErrorMessage, useDeleteMCPLibraryEntryMutation } from "@/lib/store";
 import type { MCPLibraryEntry } from "@/lib/types/mcp";
 import { Link } from "@tanstack/react-router";
-import { BookIcon, Check, Download, LogIn, Trash2 } from "lucide-react";
+import { BookIcon, Check, Copy, Download, LogIn, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
@@ -59,6 +59,21 @@ export function MCPLibraryServersTable({
 				<TableBody>
 					{servers.map((server) => {
 						const isInstalled = installedServerSlugs.has(server.slug);
+						const endpointSlug =
+							server.installed_endpoint_slug ||
+							(typeof server.metadata?.endpoint_slug === "string" ? server.metadata.endpoint_slug : undefined);
+						const httpEndpointPath = endpointSlug ? `/mcp/${endpointSlug}` : undefined;
+						const toolCount = typeof server.metadata?.tool_count === "number" ? server.metadata.tool_count : undefined;
+						const hasOptionalEnvs =
+							Array.isArray(server.metadata?.optional_envs) && (server.metadata.optional_envs as unknown[]).length > 0;
+
+						const copyHttpUrl = () => {
+							if (!httpEndpointPath) return;
+							const fullUrl = `${window.location.origin}${httpEndpointPath}`;
+							navigator.clipboard?.writeText(fullUrl);
+							toast.success(`已复制 HTTP MCP 地址：${fullUrl}`);
+						};
+
 						return (
 							<TableRow key={server.slug} className="group" data-testid={`mcp-library-table-row-${server.slug}`}>
 								<TableCell>
@@ -82,6 +97,16 @@ export function MCPLibraryServersTable({
 									<div className="min-w-0 space-y-1">
 										<div className="flex min-w-0 flex-wrap items-center gap-2">
 											<span className="font-medium">{server.name}</span>
+											{toolCount !== undefined && (
+												<Badge variant="secondary" className="text-[11px]">
+													{toolCount} 个工具
+												</Badge>
+											)}
+											{httpEndpointPath && (
+												<Badge variant="outline" className="font-mono text-[11px]">
+													{httpEndpointPath}
+												</Badge>
+											)}
 											{isInstalled && (
 												<Badge variant="success" className="gap-1">
 													<Check className="size-3" />
@@ -102,11 +127,28 @@ export function MCPLibraryServersTable({
 											{transportLabel(server.connection_type)}
 										</span>
 										<span className="bg-border h-3 w-px shrink-0" />
-										<span className="truncate">{authLabel(server.auth_type)}</span>
+										<span className="truncate">{hasOptionalEnvs ? "可选凭证 (免密可用)" : authLabel(server.auth_type)}</span>
 									</div>
 								</TableCell>
 								<TableCell className="text-right">
 									<div className="flex justify-end gap-2">
+										{isInstalled && httpEndpointPath && (
+											<Tooltip>
+												<TooltipTrigger asChild>
+													<Button
+														type="button"
+														variant="outline"
+														size="icon"
+														onClick={copyHttpUrl}
+														aria-label={`复制 HTTP MCP 地址 (${httpEndpointPath})`}
+														data-testid={`mcp-library-table-copy-url-${server.slug}`}
+													>
+														<Copy className="h-4 w-4" />
+													</Button>
+												</TooltipTrigger>
+												<TooltipContent>复制独立 HTTP MCP 地址 ({httpEndpointPath})</TooltipContent>
+											</Tooltip>
+										)}
 										{canDelete && (
 											<div className="opacity-0 group-hover:opacity-100">
 												<Tooltip>

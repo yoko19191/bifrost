@@ -13,6 +13,15 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+const LegacyGPTLoadVirtualKeyPrefix = "sk-gl-"
+
+// HasVirtualKeyPrefix reports whether s carries a recognized Bifrost ("sk-bf-")
+// or migrated GPT-Load ("sk-gl-") virtual key prefix.
+func HasVirtualKeyPrefix(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.HasPrefix(lower, VirtualKeyPrefix) || strings.HasPrefix(lower, LegacyGPTLoadVirtualKeyPrefix)
+}
+
 // ParseVirtualKeyFromFastHTTPRequest parses the virtual key from FastHTTP request headers.
 // Parameters:
 //   - req: The FastHTTP request containing headers to parse
@@ -21,33 +30,33 @@ import (
 //   - *string: The virtual key if found, nil otherwise
 func ParseVirtualKeyFromFastHTTPRequest(req *fasthttp.RequestCtx) *string {
 	vkHeader := string(req.Request.Header.Peek("x-bf-vk"))
-	if vkHeader != "" && strings.HasPrefix(strings.ToLower(vkHeader), VirtualKeyPrefix) {
+	if vkHeader != "" && HasVirtualKeyPrefix(vkHeader) {
 		return bifrost.Ptr(vkHeader)
 	}
 	authHeader := string(req.Request.Header.Peek("Authorization"))
 	if authHeader != "" {
 		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
 			authHeaderValue := strings.TrimSpace(authHeader[7:]) // Remove "Bearer " prefix
-			if authHeaderValue != "" && strings.HasPrefix(strings.ToLower(authHeaderValue), VirtualKeyPrefix) {
+			if authHeaderValue != "" && HasVirtualKeyPrefix(authHeaderValue) {
 				return bifrost.Ptr(authHeaderValue)
 			}
 		}
 	}
 	xAPIKey := string(req.Request.Header.Peek("x-api-key"))
-	if xAPIKey != "" && strings.HasPrefix(strings.ToLower(xAPIKey), VirtualKeyPrefix) {
+	if xAPIKey != "" && HasVirtualKeyPrefix(xAPIKey) {
 		return bifrost.Ptr(xAPIKey)
 	}
 	xGoogleAPIKey := string(req.Request.Header.Peek("x-goog-api-key"))
-	if xGoogleAPIKey != "" && strings.HasPrefix(strings.ToLower(xGoogleAPIKey), VirtualKeyPrefix) {
+	if xGoogleAPIKey != "" && HasVirtualKeyPrefix(xGoogleAPIKey) {
 		return bifrost.Ptr(xGoogleAPIKey)
 	}
 	azureAPIKey := string(req.Request.Header.Peek("api-key"))
-	if azureAPIKey != "" && strings.HasPrefix(strings.ToLower(azureAPIKey), VirtualKeyPrefix) {
+	if azureAPIKey != "" && HasVirtualKeyPrefix(azureAPIKey) {
 		return bifrost.Ptr(azureAPIKey)
 	}
 	// Azure AI Speech clients send their key as Ocp-Apim-Subscription-Key.
 	speechAPIKey := string(req.Request.Header.Peek("Ocp-Apim-Subscription-Key"))
-	if speechAPIKey != "" && strings.HasPrefix(strings.ToLower(speechAPIKey), VirtualKeyPrefix) {
+	if speechAPIKey != "" && HasVirtualKeyPrefix(speechAPIKey) {
 		return bifrost.Ptr(speechAPIKey)
 	}
 	return nil

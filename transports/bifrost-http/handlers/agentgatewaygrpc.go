@@ -385,12 +385,12 @@ func resolveVirtualKeyFromGRPCMetadata(md metadata.MD) (string, string) {
 	auth := get("authorization")
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
 		token := strings.TrimSpace(auth[7:])
-		if strings.HasPrefix(strings.ToLower(token), governance.VirtualKeyPrefix) {
+		if governance.HasVirtualKeyPrefix(token) {
 			return token, "authorization"
 		}
 	}
 	for _, key := range []string{"x-api-key", "x-goog-api-key", "api-key"} {
-		if value := get(key); strings.HasPrefix(strings.ToLower(value), governance.VirtualKeyPrefix) {
+		if value := get(key); governance.HasVirtualKeyPrefix(value) {
 			return value, key
 		}
 	}

@@ -61,7 +61,7 @@ func DirectKeyFromHeaders(store HandlerStore, directKey, authorization, xAPIKey,
 		return schemas.Key{}, false
 	}
 	isProviderKey := func(v string) bool {
-		return v != "" && !strings.HasPrefix(strings.ToLower(v), governance.VirtualKeyPrefix)
+		return v != "" && !governance.HasVirtualKeyPrefix(v)
 	}
 	var apiKey string
 	if strings.HasPrefix(strings.ToLower(authorization), "bearer ") {
@@ -539,26 +539,26 @@ func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*sch
 			// Only accept Bearer token format: "Bearer ..."
 			if strings.HasPrefix(strings.ToLower(valueStr), "bearer ") {
 				authHeaderValue := strings.TrimSpace(valueStr[7:]) // Remove "Bearer " prefix
-				if authHeaderValue != "" && strings.HasPrefix(strings.ToLower(authHeaderValue), governance.VirtualKeyPrefix) {
+				if authHeaderValue != "" && governance.HasVirtualKeyPrefix(authHeaderValue) {
 					bifrostCtx.SetValue(schemas.BifrostContextKeyVirtualKey, authHeaderValue)
 					return true
 				}
 			}
 		}
-		if keyStr == "x-api-key" && strings.HasPrefix(strings.ToLower(string(value)), governance.VirtualKeyPrefix) {
+		if keyStr == "x-api-key" && governance.HasVirtualKeyPrefix(string(value)) {
 			bifrostCtx.SetValue(schemas.BifrostContextKeyVirtualKey, string(value))
 			return true
 		}
-		if keyStr == "x-goog-api-key" && strings.HasPrefix(strings.ToLower(string(value)), governance.VirtualKeyPrefix) {
+		if keyStr == "x-goog-api-key" && governance.HasVirtualKeyPrefix(string(value)) {
 			bifrostCtx.SetValue(schemas.BifrostContextKeyVirtualKey, string(value))
 			return true
 		}
-		if keyStr == "api-key" && strings.HasPrefix(strings.ToLower(string(value)), governance.VirtualKeyPrefix) {
+		if keyStr == "api-key" && governance.HasVirtualKeyPrefix(string(value)) {
 			bifrostCtx.SetValue(schemas.BifrostContextKeyVirtualKey, string(value))
 			return true
 		}
 		// Azure AI Speech clients send their key as Ocp-Apim-Subscription-Key.
-		if keyStr == "ocp-apim-subscription-key" && strings.HasPrefix(strings.ToLower(string(value)), governance.VirtualKeyPrefix) {
+		if keyStr == "ocp-apim-subscription-key" && governance.HasVirtualKeyPrefix(string(value)) {
 			bifrostCtx.SetValue(schemas.BifrostContextKeyVirtualKey, string(value))
 			return true
 		}

@@ -1508,7 +1508,11 @@ func (h *MCPHandler) getMCPLibrary(ctx *fasthttp.RequestCtx) {
 			return
 		}
 		for i := range servers {
-			servers[i].Installed = isMCPLibraryEntryInstalled(&servers[i].TableMCPLibrary, clients)
+			if matched := findInstalledMCPLibraryClient(&servers[i].TableMCPLibrary, clients); matched != nil {
+				servers[i].Installed = true
+				servers[i].InstalledEndpointSlug = matched.EndpointSlug
+				servers[i].InstalledClientID = matched.ClientID
+			}
 		}
 	}
 
@@ -1525,7 +1529,9 @@ func (h *MCPHandler) getMCPLibrary(ctx *fasthttp.RequestCtx) {
 // installs it, so the UI does not have to match against the client list itself.
 type MCPLibraryEntryResponse struct {
 	configstoreTables.TableMCPLibrary
-	Installed bool `json:"installed"`
+	Installed             bool   `json:"installed"`
+	InstalledEndpointSlug string `json:"installed_endpoint_slug,omitempty"`
+	InstalledClientID     string `json:"installed_client_id,omitempty"`
 }
 
 // mcpLibraryClientsPageSize is the page size used to read every MCP client row
@@ -1589,32 +1595,51 @@ func normalizeMCPLibraryURL(u string) string {
 // derived from that name. The endpoint slug is immutable, so the last rule
 // keeps a renamed client recognized.
 func isMCPLibraryEntryInstalled(entry *configstoreTables.TableMCPLibrary, clients []configstoreTables.TableMCPClient) bool {
+	return findInstalledMCPLibraryClient(entry, clients) != nil
+}
+
+func findInstalledMCPLibraryClient(entry *configstoreTables.TableMCPLibrary, clients []configstoreTables.TableMCPClient) *configstoreTables.TableMCPClient {
 	installName := sanitizeMCPLibraryServerName(entry.Name)
 	installSlug := configstore.Slugify(installName)
+	var metaClientName, metaEndpointSlug string
+	if entry.Metadata != nil {
+		if cn, ok := entry.Metadata["client_name"].(string); ok {
+			metaClientName = strings.TrimSpace(cn)
+		}
+		if es, ok := entry.Metadata["endpoint_slug"].(string); ok {
+			metaEndpointSlug = strings.TrimSpace(es)
+		}
+	}
 	entryURL := normalizeMCPLibraryURL(entry.ConnectionURL)
 	for i := range clients {
 		client := &clients[i]
 		if strings.EqualFold(client.Name, installName) {
-			return true
+			return client
+		}
+		if metaClientName != "" && strings.EqualFold(client.Name, metaClientName) {
+			return client
 		}
 		if installSlug != "" && client.EndpointSlug == installSlug {
-			return true
+			return client
+		}
+		if metaEndpointSlug != "" && client.EndpointSlug == metaEndpointSlug {
+			return client
 		}
 		if entryURL != "" && client.ConnectionString != nil {
 			if normalizeMCPLibraryURL(client.ConnectionString.Val) == entryURL ||
 				normalizeMCPLibraryURL(client.ConnectionString.GetRawRef()) == entryURL {
-				return true
+				return client
 			}
 		}
 		if entry.StdioConfig != nil && client.StdioConfig != nil {
 			command := strings.TrimSpace(entry.StdioConfig.Command)
 			if command != "" && command == strings.TrimSpace(client.StdioConfig.Command) &&
 				slices.Equal(entry.StdioConfig.Args, client.StdioConfig.Args) {
-				return true
+				return client
 			}
 		}
 	}
-	return false
+	return nil
 }
 
 // getMCPLibraryFilterData handles GET /api/mcp/library/filterdata — returns the

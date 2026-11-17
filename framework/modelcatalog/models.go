@@ -232,6 +232,47 @@ func (mc *ModelCatalog) GetUnfilteredModelsForProvider(provider schemas.ModelPro
 	if len(liveModels) > 0 && len(datasheetModels) > 0 {
 		slices.Sort(base)
 	}
+	if entries := mc.keyconf.EntriesFor(provider); len(entries) > 0 {
+		seen := make(map[string]struct{}, len(base))
+		for _, m := range base {
+			seen[m] = struct{}{}
+		}
+		added := false
+		for _, e := range entries {
+			if !e.Enabled {
+				continue
+			}
+			for alias, cfg := range e.Aliases {
+				if !schemas.IsRegexEntry(alias) {
+					if _, ok := seen[alias]; !ok {
+						seen[alias] = struct{}{}
+						base = append(base, alias)
+						added = true
+					}
+				}
+				if target := cfg.EffectiveModelID(); target != "" && !schemas.IsRegexEntry(target) {
+					if _, ok := seen[target]; !ok {
+						seen[target] = struct{}{}
+						base = append(base, target)
+						added = true
+					}
+				}
+			}
+			for _, m := range e.Allowed {
+				if m == "*" || schemas.IsRegexEntry(m) {
+					continue
+				}
+				if _, ok := seen[m]; !ok {
+					seen[m] = struct{}{}
+					base = append(base, m)
+					added = true
+				}
+			}
+		}
+		if added {
+			slices.Sort(base)
+		}
+	}
 	return base
 }
 

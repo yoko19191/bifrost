@@ -113,7 +113,13 @@ func (provider *OpenAIProvider) buildRequestURL(ctx *schemas.BifrostContext, def
 	if isCompleteURL {
 		return path
 	}
-	return provider.networkConfig.BaseURL + path
+	baseURL := provider.networkConfig.BaseURL
+	if provider.customProviderConfig != nil && strings.HasPrefix(path, "/v1/") {
+		if strings.HasSuffix(baseURL, "/v1") || strings.HasSuffix(baseURL, "/v3") {
+			return baseURL + strings.TrimPrefix(path, "/v1")
+		}
+	}
+	return baseURL + path
 }
 
 func (provider *OpenAIProvider) ListModels(ctx *schemas.BifrostContext, keys []schemas.Key, request *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
@@ -199,6 +205,37 @@ func ListModelsByKey(
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
+		if providerName != schemas.OpenAI && (resp.StatusCode() == fasthttp.StatusNotFound || resp.StatusCode() == fasthttp.StatusMethodNotAllowed) && (len(key.Models) > 0 || len(key.Aliases) > 0) {
+			openaiResponse := &OpenAIListModelsResponse{}
+			seen := make(map[string]struct{})
+			for _, m := range key.Models {
+				if m == "*" || schemas.IsRegexEntry(m) {
+					continue
+				}
+				if _, ok := seen[m]; !ok {
+					seen[m] = struct{}{}
+					openaiResponse.Data = append(openaiResponse.Data, OpenAIModel{ID: m})
+				}
+			}
+			for aliasKey, aliasCfg := range key.Aliases {
+				if !schemas.IsRegexEntry(aliasKey) {
+					if _, ok := seen[aliasKey]; !ok {
+						seen[aliasKey] = struct{}{}
+						openaiResponse.Data = append(openaiResponse.Data, OpenAIModel{ID: aliasKey})
+					}
+				}
+				if target := aliasCfg.EffectiveModelID(); target != "" && !schemas.IsRegexEntry(target) {
+					if _, ok := seen[target]; !ok {
+						seen[target] = struct{}{}
+						openaiResponse.Data = append(openaiResponse.Data, OpenAIModel{ID: target})
+					}
+				}
+			}
+			response := openaiResponse.ToBifrostListModelsResponse(providerName, key.Models, key.BlacklistedModels, key.Aliases, unfiltered)
+			response.ExtraFields.Latency = latency.Milliseconds()
+			response.ExtraFields.ProviderResponseHeaders = providerResponseHeaders
+			return response, nil
+		}
 		bifrostErr := ParseOpenAIError(resp)
 		return nil, providerUtils.SetErrorLatency(bifrostErr, latency)
 	}

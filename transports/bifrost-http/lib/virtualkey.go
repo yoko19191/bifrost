@@ -61,7 +61,7 @@ func ResolveVirtualKeyFromHeaders(ctx *fasthttp.RequestCtx) (string, VirtualKeyH
 	auth := strings.TrimSpace(string(ctx.Request.Header.Peek("Authorization")))
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
 		token := strings.TrimSpace(auth[7:])
-		if strings.HasPrefix(strings.ToLower(token), governance.VirtualKeyPrefix) {
+		if governance.HasVirtualKeyPrefix(token) {
 			return token, VirtualKeyHeaderSourceAuthorization
 		}
 	}
@@ -72,7 +72,7 @@ func ResolveVirtualKeyFromHeaders(ctx *fasthttp.RequestCtx) (string, VirtualKeyH
 		VirtualKeyHeaderSourceAPIKey,
 	} {
 		value := strings.TrimSpace(string(ctx.Request.Header.Peek(string(source))))
-		if strings.HasPrefix(strings.ToLower(value), governance.VirtualKeyPrefix) {
+		if governance.HasVirtualKeyPrefix(value) {
 			return value, source
 		}
 	}

@@ -59,6 +59,12 @@ export function sanitizeServerName(name: string): string {
 function buildInitialValues(server: MCPLibraryEntry): CreateMCPClientRequest {
 	const authType = (server.auth_type || "none") as MCPAuthType;
 	const isStdio = server.connection_type === "stdio";
+	const meta = server.metadata || {};
+	const metaClientName = typeof meta.client_name === "string" && meta.client_name.trim() ? meta.client_name.trim() : "";
+	const metaEndpointSlug = typeof meta.endpoint_slug === "string" && meta.endpoint_slug.trim() ? meta.endpoint_slug.trim() : undefined;
+	const metaCodeMode = meta.recommended_code_mode === true;
+	const metaAllowByDefault = meta.allow_by_default === true ? true : undefined;
+
 	// A header-auth entry declares which header names it needs; prefill them as
 	// empty rows so the installer only has to fill in values.
 	const declaredHeaders = server.required_header_keys?.length
@@ -66,8 +72,10 @@ function buildInitialValues(server: MCPLibraryEntry): CreateMCPClientRequest {
 		: { Authorization: { ...emptySecretVar } };
 
 	return {
-		name: sanitizeServerName(server.name),
-		is_code_mode_client: false,
+		name: metaClientName || sanitizeServerName(server.name),
+		endpoint_slug: metaEndpointSlug,
+		is_code_mode_client: metaCodeMode,
+		allow_by_default: metaAllowByDefault,
 		is_ping_available: true,
 		connection_type: server.connection_type || "http",
 		connection_string: isStdio ? undefined : { value: server.connection_url || "", ref: "" },
@@ -184,6 +192,15 @@ export function MCPLibraryInstallSheet({ server, open, onClose, onInstalled }: M
 		}
 
 		const payload = buildMCPClientPayload(data, satellites);
+		const optionalEnvs = Array.isArray(server.metadata?.optional_envs)
+			? new Set((server.metadata?.optional_envs as unknown[]).map((k) => String(k).trim()))
+			: null;
+		if (isStdio && payload.stdio_config && optionalEnvs && optionalEnvs.size > 0) {
+			payload.stdio_config.envs = (payload.stdio_config.envs || []).filter((entry) => {
+				if (entry.includes("=")) return true;
+				return !optionalEnvs.has(entry.trim());
+			});
+		}
 
 		// Per-user-headers: stash the payload and open the headers test dialog.
 		if (data.auth_type === "per_user_headers") {
@@ -224,6 +241,13 @@ export function MCPLibraryInstallSheet({ server, open, onClose, onInstalled }: M
 	const isOauth = authType === "oauth" || authType === "per_user_oauth";
 	const isPerUserHeaders = authType === "per_user_headers";
 	const installButtonLabel = isOauth || isPerUserHeaders ? t("common.continue") : t("common.install");
+	const metaHttpPath = typeof server.metadata?.http_endpoint_path === "string" ? server.metadata.http_endpoint_path : undefined;
+	const metaToolCount = typeof server.metadata?.tool_count === "number" ? server.metadata.tool_count : undefined;
+	const metaTools = Array.isArray(server.metadata?.tools) ? (server.metadata.tools as string[]) : [];
+	const metaEnvHints =
+		server.metadata?.env_hints && typeof server.metadata.env_hints === "object"
+			? Object.entries(server.metadata.env_hints as Record<string, string>)
+			: [];
 
 	return (
 		<Sheet open={open} onOpenChange={(sheetOpen) => !sheetOpen && !oauthFlow && !headersFlow && onClose()}>
@@ -268,9 +292,54 @@ export function MCPLibraryInstallSheet({ server, open, onClose, onInstalled }: M
 												{server.category}
 											</Badge>
 										)}
+										{metaHttpPath && (
+											<Badge variant="outline" className="bg-background font-mono text-[11px]">
+												HTTP: {metaHttpPath}
+											</Badge>
+										)}
+										{metaToolCount !== undefined && (
+											<Badge variant="outline" className="bg-background text-[11px]">
+												{metaToolCount} 个工具
+											</Badge>
+										)}
 									</div>
 								</div>
 							</div>
+
+							{metaTools.length > 0 && (
+								<div className="bg-muted/20 space-y-2 rounded-md border p-3">
+									<div className="flex items-center justify-between">
+										<p className="text-xs font-medium">
+											包含的 MCP 工具 ({metaToolCount ?? metaTools.length} 个)
+										</p>
+										{metaHttpPath && (
+											<span className="text-muted-foreground font-mono text-[11px]">
+												安装后访问路径：{metaHttpPath}
+											</span>
+										)}
+									</div>
+									<div className="flex max-h-28 flex-wrap gap-1 overflow-y-auto">
+										{metaTools.map((toolName) => (
+											<Badge key={toolName} variant="secondary" className="font-mono text-[10px]">
+												{toolName}
+											</Badge>
+										))}
+									</div>
+								</div>
+							)}
+
+							{metaEnvHints.length > 0 && (
+								<div className="bg-primary/5 border-primary/20 space-y-1.5 rounded-md border p-3 text-xs">
+									<p className="font-medium">凭证填写说明（全部为可选凭证，留空可直接按免费公共配额安装运行）：</p>
+									<ul className="text-muted-foreground list-disc space-y-1 pl-4">
+										{metaEnvHints.map(([envKey, hint]) => (
+											<li key={envKey}>
+												<code className="text-foreground font-mono font-semibold">{envKey}</code>：{hint}
+											</li>
+										))}
+									</ul>
+								</div>
+							)}
 
 							{/* Name */}
 							<FormField
