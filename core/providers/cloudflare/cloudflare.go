@@ -250,11 +250,17 @@ func (provider *CloudflareProvider) ResponsesStream(ctx *schemas.BifrostContext,
 	)
 }
 
-// Embedding performs an embedding request to Cloudflare's OpenAI-compatible API.
+// Embedding performs an embedding request to Cloudflare Workers AI.
+// Multimodal models such as EmbeddingGemma 2, multimodal inputs, conversation messages,
+// and per-item task overrides route to /ai/run/{model}; other text models keep the
+// OpenAI-compatible /ai/v1/embeddings endpoint.
 func (provider *CloudflareProvider) Embedding(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
 	accountURL, bifrostErr := provider.accountURLOrError(key)
 	if bifrostErr != nil {
 		return nil, bifrostErr
+	}
+	if shouldUseNativeCloudflareEmbedding(request) {
+		return provider.nativeEmbedding(ctx, key, accountURL, request)
 	}
 	return openai.HandleOpenAIEmbeddingRequest(
 		ctx,

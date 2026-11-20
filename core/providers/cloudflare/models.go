@@ -10,8 +10,9 @@ import (
 // cloudflareListedTasks are the Workers AI tasks served by the OpenAI-compatible
 // endpoints this provider calls; models of other tasks are not listed.
 var cloudflareListedTasks = map[string]bool{
-	"Text Generation": true,
-	"Text Embeddings": true,
+	"Text Generation":       true,
+	"Text Embeddings":       true,
+	"Multimodal Embeddings": true,
 }
 
 // ToBifrostListModelsResponse converts the Workers AI model search response into

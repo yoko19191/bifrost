@@ -198,6 +198,7 @@ var compactionParamsKnownFields = map[string]bool{
 var embeddingParamsKnownFields = map[string]bool{
 	"model":           true,
 	"input":           true,
+	"messages":        true,
 	"fallbacks":       true,
 	"encoding_format": true,
 	"dimensions":      true,
@@ -616,7 +617,12 @@ func (e *EmbeddingRequestInput) UnmarshalJSON(data []byte) error {
 		e.TokenBatches = tokenBatches
 		return nil
 	}
-	return sonic.Unmarshal(data, &e.Items)
+	items, err := schemas.UnmarshalEmbeddingMultimodalInput(data)
+	if err != nil {
+		return err
+	}
+	e.Items = items
+	return nil
 }
 
 // toEmbeddingInput normalises every input variant into []EmbeddingInputItem.
@@ -646,7 +652,8 @@ func (e *EmbeddingRequestInput) toEmbeddingInput() []schemas.EmbeddingInputItem 
 
 // EmbeddingRequest is a bifrost embedding request.
 type EmbeddingRequest struct {
-	Input EmbeddingRequestInput `json:"input"`
+	Input    EmbeddingRequestInput           `json:"input"`
+	Messages *schemas.EmbeddingMessagesInput `json:"messages,omitempty"`
 	BifrostParams
 	*schemas.EmbeddingParameters
 }
@@ -1327,8 +1334,14 @@ func prepareEmbeddingRequest(ctx *fasthttp.RequestCtx, config *lib.Config) (*Emb
 		return nil, nil, err
 	}
 	contents := req.Input.toEmbeddingInput()
+	if len(contents) > 0 && !req.Messages.IsEmpty() {
+		return nil, nil, fmt.Errorf("cannot specify both input and messages for embeddings")
+	}
+	if len(contents) == 0 && !req.Messages.IsEmpty() {
+		contents = req.Messages.ToEmbeddingInput()
+	}
 	if len(contents) == 0 {
-		return nil, nil, fmt.Errorf("input is required for embeddings")
+		return nil, nil, fmt.Errorf("input or messages is required for embeddings")
 	}
 	if err := schemas.ValidateEmbeddingInput(contents); err != nil {
 		return nil, nil, err

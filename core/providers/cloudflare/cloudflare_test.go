@@ -202,6 +202,7 @@ func TestListModels_PagesFiltersTasksAndListsClef(t *testing.T) {
 	}
 	secondPage := []string{
 		`{"name":"@cf/baai/bge-large-en-v1.5","description":"embeddings","task":{"name":"Text Embeddings"}}`,
+		`{"name":"@cf/google/embeddinggemma-2","description":"multimodal embeddings","task":{"name":"Multimodal Embeddings"}}`,
 		`{"name":"@cf/cloudflare/clef-flash","task":{"name":"Text Generation"}}`,
 		`{"name":"@cf/cloudflare/clef-omni","task":{"name":"Text Generation"}}`,
 		`{"name":"@cf/black-forest-labs/flux-1-schnell","task":{"name":"Text-to-Image"}}`,
@@ -233,8 +234,8 @@ func TestListModels_PagesFiltersTasksAndListsClef(t *testing.T) {
 	if strings.Join(pages, ",") != "1,2" {
 		t.Errorf("pages requested = %v, want [1 2]", pages)
 	}
-	if len(resp.Data) != 103 {
-		t.Fatalf("models = %d, want 103 (100 chat + 1 embedding + clef-flash + clef-omni)", len(resp.Data))
+	if len(resp.Data) != 104 {
+		t.Fatalf("models = %d, want 104 (100 chat + 2 embedding + clef-flash + clef-omni)", len(resp.Data))
 	}
 	byID := make(map[string]schemas.Model, len(resp.Data))
 	for _, model := range resp.Data {
@@ -242,6 +243,9 @@ func TestListModels_PagesFiltersTasksAndListsClef(t *testing.T) {
 	}
 	if _, ok := byID["cloudflare/@cf/baai/bge-large-en-v1.5"]; !ok {
 		t.Fatal("embedding model missing")
+	}
+	if _, ok := byID["cloudflare/@cf/google/embeddinggemma-2"]; !ok {
+		t.Fatal("multimodal embedding model missing")
 	}
 	for _, clef := range []string{"cloudflare/@cf/cloudflare/clef-flash", "cloudflare/@cf/cloudflare/clef-omni"} {
 		if _, ok := byID[clef]; !ok {
@@ -608,4 +612,316 @@ func TestListModels_MatchesAllowListAgainstCloudflareIDs(t *testing.T) {
 	if len(resp.Data) != 1 || resp.Data[0].ID != "cloudflare/@cf/cloudflare/clef-flash" {
 		t.Fatalf("models = %+v, want only Clef under its Cloudflare ID", resp.Data)
 	}
+}
+
+func TestEmbeddingGemma2_TextTokensBase64AndTaskPrefix(t *testing.T) {
+	t.Run("single text and short model name resolve to native endpoint and unwrap result", func(t *testing.T) {
+		var capturedPath string
+		var capturedBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cf-Ray", "ray-emb-1")
+			_, _ = fmt.Fprint(w, `{"result":{"id":"embd-1","object":"list","created":1793902589,"model":"@cf/google/embeddinggemma-2","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"usage":{"prompt_tokens":4,"total_tokens":4}},"success":true,"errors":[],"messages":[]}`)
+		}))
+		defer server.Close()
+
+		provider := newTestProvider(t, server.URL)
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		resp, bifrostErr := provider.Embedding(ctx, newTestKey("acct-1"), &schemas.BifrostEmbeddingRequest{
+			Provider: schemas.Cloudflare,
+			Model:    "embeddinggemma-2",
+			Input: []schemas.EmbeddingInputItem{
+				{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("hello world")}}},
+			},
+		})
+		if bifrostErr != nil {
+			t.Fatalf("Embedding: %v", bifrostErr.Error.Message)
+		}
+		if capturedPath != "/accounts/acct-1/ai/run/@cf/google/embeddinggemma-2" {
+			t.Errorf("path = %q, want /accounts/acct-1/ai/run/@cf/google/embeddinggemma-2", capturedPath)
+		}
+		if capturedBody["input"] != "hello world" {
+			t.Errorf("input = %#v, want hello world", capturedBody["input"])
+		}
+		if len(resp.Data) != 1 || len(resp.Data[0].Embedding.EmbeddingArray) != 3 {
+			t.Errorf("unexpected response data: %+v", resp.Data)
+		}
+		if resp.Usage == nil || resp.Usage.PromptTokens != 4 || resp.ExtraFields.ProviderResponseHeaders["Cf-Ray"] != "ray-emb-1" {
+			t.Errorf("unexpected metadata: usage=%+v headers=%+v", resp.Usage, resp.ExtraFields.ProviderResponseHeaders)
+		}
+	})
+
+	t.Run("batch text with dimensions base64 encoding and per-item task prefixes", func(t *testing.T) {
+		var capturedBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"result":{"object":"list","data":[{"object":"embedding","index":0,"embedding":"AACAPw=="},{"object":"embedding","index":1,"embedding":"AAAAQA=="},{"object":"embedding","index":2,"embedding":"AABAvw=="}],"usage":{"prompt_tokens":20,"total_tokens":20}},"success":true,"errors":[]}`)
+		}))
+		defer server.Close()
+
+		provider := newTestProvider(t, server.URL)
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		resp, bifrostErr := provider.Embedding(ctx, newTestKey("acct-1"), &schemas.BifrostEmbeddingRequest{
+			Provider: schemas.Cloudflare,
+			Model:    "@cf/google/embeddinggemma-2",
+			Input: []schemas.EmbeddingInputItem{
+				{
+					Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("trail running shoes")}},
+					Params:  &schemas.EmbeddingParameters{TaskType: schemas.Ptr("RETRIEVAL_QUERY")},
+				},
+				{
+					Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("breathable mesh upper")}},
+					Params:  &schemas.EmbeddingParameters{TaskType: schemas.Ptr("RETRIEVAL_DOCUMENT"), Title: schemas.Ptr("Trail Runner X")},
+				},
+				{
+					Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("task: clustering | query: already prefixed")}},
+					Params:  &schemas.EmbeddingParameters{TaskType: schemas.Ptr("RETRIEVAL_QUERY")},
+				},
+			},
+			Params: &schemas.EmbeddingParameters{
+				Dimensions:     schemas.Ptr(256),
+				EncodingFormat: schemas.Ptr("base64"),
+			},
+		})
+		if bifrostErr != nil {
+			t.Fatalf("Embedding: %v", bifrostErr.Error.Message)
+		}
+		if capturedBody["dimensions"] != float64(256) || capturedBody["encoding_format"] != "base64" {
+			t.Errorf("params mismatch: %+v", capturedBody)
+		}
+		wantInputs := []any{
+			"task: search result | query: trail running shoes",
+			"title: Trail Runner X | text: breathable mesh upper",
+			"task: clustering | query: already prefixed",
+		}
+		if !reflect.DeepEqual(capturedBody["input"], wantInputs) {
+			t.Errorf("input = %#v, want %#v", capturedBody["input"], wantInputs)
+		}
+		if resp.Model != "@cf/google/embeddinggemma-2" {
+			t.Errorf("backfilled model = %q, want @cf/google/embeddinggemma-2", resp.Model)
+		}
+		if len(resp.Data) != 3 || resp.Data[0].Embedding.EmbeddingStr == nil || *resp.Data[0].Embedding.EmbeddingStr != "AACAPw==" {
+			t.Errorf("unexpected base64 embeddings: %+v", resp.Data)
+		}
+	})
+
+	t.Run("token IDs single and batch", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			items []schemas.EmbeddingInputItem
+			want  any
+		}{
+			{
+				name:  "single token array",
+				items: []schemas.EmbeddingInputItem{{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeTokens, Tokens: []int{10, 20, 30}}}}},
+				want:  []any{float64(10), float64(20), float64(30)},
+			},
+			{
+				name: "batch token arrays",
+				items: []schemas.EmbeddingInputItem{
+					{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeTokens, Tokens: []int{1, 2}}}},
+					{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeTokens, Tokens: []int{3, 4}}}},
+				},
+				want: []any{[]any{float64(1), float64(2)}, []any{float64(3), float64(4)}},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var capturedBody map[string]any
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `{"result":{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.5]}]},"success":true}`)
+				}))
+				defer server.Close()
+
+				provider := newTestProvider(t, server.URL)
+				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				_, bifrostErr := provider.Embedding(ctx, newTestKey("acct-1"), &schemas.BifrostEmbeddingRequest{
+					Provider: schemas.Cloudflare,
+					Model:    "@cf/google/embeddinggemma-2",
+					Input:    tc.items,
+				})
+				if bifrostErr != nil {
+					t.Fatalf("Embedding: %v", bifrostErr.Error.Message)
+				}
+				if !reflect.DeepEqual(capturedBody["input"], tc.want) {
+					t.Errorf("input = %#v, want %#v", capturedBody["input"], tc.want)
+				}
+			})
+		}
+	})
+}
+
+func TestEmbeddingGemma2_MultimodalAndMessages(t *testing.T) {
+	t.Run("interleaved text image video audio converts to Cloudflare messages", func(t *testing.T) {
+		var capturedPath string
+		var capturedBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"result":{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":266,"total_tokens":266}},"success":true}`)
+		}))
+		defer server.Close()
+
+		provider := newTestProvider(t, server.URL)
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		_, bifrostErr := provider.Embedding(ctx, newTestKey("acct-1"), &schemas.BifrostEmbeddingRequest{
+			Provider: schemas.Cloudflare,
+			Model:    "@cf/google/embeddinggemma-2",
+			Input: []schemas.EmbeddingInputItem{
+				{
+					Content: schemas.EmbeddingContent{
+						{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("running shoe")},
+						{Type: schemas.EmbeddingContentPartTypeImage, Image: &schemas.EmbeddingMediaPart{Data: schemas.Ptr("AAAA"), MIMEType: schemas.Ptr("image/png")}},
+						{Type: schemas.EmbeddingContentPartTypeVideo, Video: &schemas.EmbeddingMediaPart{URL: schemas.Ptr("data:video/mp4;base64,BBBB")}},
+						{Type: schemas.EmbeddingContentPartTypeAudio, Audio: &schemas.EmbeddingMediaPart{Data: schemas.Ptr("CCCC"), MIMEType: schemas.Ptr("audio/wav")}},
+						{Type: schemas.EmbeddingContentPartTypeAudio, Audio: &schemas.EmbeddingMediaPart{URL: schemas.Ptr("data:audio/mp3;base64,DDDD")}},
+					},
+				},
+			},
+			Params: &schemas.EmbeddingParameters{Dimensions: schemas.Ptr(512)},
+		})
+		if bifrostErr != nil {
+			t.Fatalf("Embedding: %v", bifrostErr.Error.Message)
+		}
+		if capturedPath != "/accounts/acct-1/ai/run/@cf/google/embeddinggemma-2" {
+			t.Errorf("path = %q", capturedPath)
+		}
+		if _, hasInput := capturedBody["input"]; hasInput {
+			t.Errorf("multimodal body must use messages, not input: %+v", capturedBody)
+		}
+		msgs, ok := capturedBody["messages"].([]any)
+		if !ok || len(msgs) != 1 {
+			t.Fatalf("expected 1-message conversation, got %#v", capturedBody["messages"])
+		}
+		msg := msgs[0].(map[string]any)
+		if msg["role"] != "user" {
+			t.Errorf("role = %v, want user", msg["role"])
+		}
+		parts := msg["content"].([]any)
+		if len(parts) != 5 {
+			t.Fatalf("parts len = %d, want 5", len(parts))
+		}
+		if parts[1].(map[string]any)["image_url"].(map[string]any)["url"] != "data:image/png;base64,AAAA" {
+			t.Errorf("image_url mismatch: %#v", parts[1])
+		}
+		if parts[2].(map[string]any)["video_url"].(map[string]any)["url"] != "data:video/mp4;base64,BBBB" {
+			t.Errorf("video_url mismatch: %#v", parts[2])
+		}
+		audio0 := parts[3].(map[string]any)["input_audio"].(map[string]any)
+		if audio0["data"] != "CCCC" || audio0["format"] != "wav" {
+			t.Errorf("input_audio mismatch: %#v", parts[3])
+		}
+		if parts[4].(map[string]any)["audio_url"].(map[string]any)["url"] != "data:audio/mp3;base64,DDDD" {
+			t.Errorf("audio_url mismatch: %#v", parts[4])
+		}
+	})
+
+	t.Run("multi-turn and batched conversations preserve roles", func(t *testing.T) {
+		var capturedBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"result":{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]},{"object":"embedding","index":1,"embedding":[0.2]}]},"success":true}`)
+		}))
+		defer server.Close()
+
+		provider := newTestProvider(t, server.URL)
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		msgsInput := &schemas.EmbeddingMessagesInput{}
+		if err := json.Unmarshal([]byte(`[
+			[{"role":"system","content":"context"},{"role":"user","content":"first"}],
+			[{"role":"user","content":[{"type":"text","text":"second"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]
+		]`), msgsInput); err != nil {
+			t.Fatal(err)
+		}
+		resp, bifrostErr := provider.Embedding(ctx, newTestKey("acct-1"), &schemas.BifrostEmbeddingRequest{
+			Provider: schemas.Cloudflare,
+			Model:    "@cf/google/embeddinggemma-2",
+			Input:    msgsInput.ToEmbeddingInput(),
+		})
+		if bifrostErr != nil {
+			t.Fatalf("Embedding: %v", bifrostErr.Error.Message)
+		}
+		if len(resp.Data) != 2 {
+			t.Fatalf("expected 2 embeddings, got %d", len(resp.Data))
+		}
+		convs, ok := capturedBody["messages"].([]any)
+		if !ok || len(convs) != 2 {
+			t.Fatalf("expected 2 conversations in messages, got %#v", capturedBody["messages"])
+		}
+		conv0 := convs[0].([]any)
+		if conv0[0].(map[string]any)["role"] != "system" || conv0[1].(map[string]any)["role"] != "user" {
+			t.Errorf("roles lost in conv0: %#v", conv0)
+		}
+	})
+}
+
+func TestEmbeddingGemma2_ErrorsAndValidation(t *testing.T) {
+	t.Run("cloudflare error envelope propagates", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"success":false,"errors":[{"code":5012,"message":"Invalid dimensions"}],"result":{}}`)
+		}))
+		defer server.Close()
+
+		provider := newTestProvider(t, server.URL)
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		_, bifrostErr := provider.Embedding(ctx, newTestKey("acct-1"), &schemas.BifrostEmbeddingRequest{
+			Provider: schemas.Cloudflare,
+			Model:    "@cf/google/embeddinggemma-2",
+			Input:    []schemas.EmbeddingInputItem{{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("hi")}}}},
+		})
+		if bifrostErr == nil || bifrostErr.Error == nil || bifrostErr.Error.Message != "Invalid dimensions" {
+			t.Fatalf("expected Invalid dimensions error, got %+v", bifrostErr)
+		}
+	})
+
+	t.Run("invalid encoding_format conflicting per-item dimensions and file part rejected", func(t *testing.T) {
+		cases := []struct {
+			name string
+			req  *schemas.BifrostEmbeddingRequest
+		}{
+			{
+				name: "unsupported encoding_format",
+				req: &schemas.BifrostEmbeddingRequest{
+					Provider: schemas.Cloudflare,
+					Model:    "@cf/google/embeddinggemma-2",
+					Input:    []schemas.EmbeddingInputItem{{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("hi")}}}},
+					Params:   &schemas.EmbeddingParameters{EncodingFormat: schemas.Ptr("int8")},
+				},
+			},
+			{
+				name: "conflicting per-item dimensions",
+				req: &schemas.BifrostEmbeddingRequest{
+					Provider: schemas.Cloudflare,
+					Model:    "@cf/google/embeddinggemma-2",
+					Input: []schemas.EmbeddingInputItem{
+						{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("a")}}, Params: &schemas.EmbeddingParameters{Dimensions: schemas.Ptr(256)}},
+						{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("b")}}, Params: &schemas.EmbeddingParameters{Dimensions: schemas.Ptr(512)}},
+					},
+				},
+			},
+			{
+				name: "unsupported file part",
+				req: &schemas.BifrostEmbeddingRequest{
+					Provider: schemas.Cloudflare,
+					Model:    "@cf/google/embeddinggemma-2",
+					Input:    []schemas.EmbeddingInputItem{{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeFile, File: &schemas.EmbeddingMediaPart{URL: schemas.Ptr("https://example.com/a.pdf")}}}}},
+				},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if _, err := cloudflare.ToCloudflareEmbeddingRequest(tc.req); err == nil {
+					t.Fatalf("%s: expected error", tc.name)
+				}
+			})
+		}
+	})
 }

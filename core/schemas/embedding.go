@@ -1,6 +1,7 @@
 package schemas
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -21,32 +22,67 @@ func (r *BifrostEmbeddingRequest) GetRawRequestBody() []byte {
 }
 
 type EmbeddingInputItem struct {
-	Content EmbeddingContent     `json:"content"`
-	Params  *EmbeddingParameters `json:"params,omitempty"`
+	Content  EmbeddingContent     `json:"content"`
+	Messages []EmbeddingMessage   `json:"messages,omitempty"`
+	Params   *EmbeddingParameters `json:"params,omitempty"`
 }
 
-// UnmarshalJSON accepts either shape: a bare array of parts, or an object carrying
-// per-item params.
+// UnmarshalJSON accepts a bare array of parts, a conversation message array,
+// or an object carrying content/messages and optional per-item params.
 //
 //	[{"type":"text","text":"hi"}]
 //	{"content":[{"type":"text","text":"hi"}],"params":{"task_type":"RETRIEVAL_QUERY"}}
 func (i *EmbeddingInputItem) UnmarshalJSON(data []byte) error {
-	var content EmbeddingContent
-	if err := Unmarshal(data, &content); err == nil {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		if isMessageArrayJSON(trimmed) {
+			var msgs []EmbeddingMessage
+			if err := Unmarshal(trimmed, &msgs); err != nil {
+				return err
+			}
+			i.Messages = msgs
+			i.Content = flattenEmbeddingMessages(msgs)
+			i.Params = nil
+			return nil
+		}
+		var content EmbeddingContent
+		if err := Unmarshal(trimmed, &content); err != nil {
+			return err
+		}
 		i.Content = content
+		i.Messages = nil
 		i.Params = nil
 		return nil
 	}
-	// alias suppresses this method to avoid infinite recursion.
-	type alias EmbeddingInputItem
-	return Unmarshal(data, (*alias)(i))
+	var raw struct {
+		Content  json.RawMessage      `json:"content"`
+		Messages []EmbeddingMessage   `json:"messages,omitempty"`
+		Params   *EmbeddingParameters `json:"params,omitempty"`
+	}
+	if err := Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	content, err := unmarshalEmbeddingMessageContent(raw.Content)
+	if err != nil {
+		return err
+	}
+	i.Messages = raw.Messages
+	i.Params = raw.Params
+	if len(content) > 0 {
+		i.Content = content
+	} else if len(raw.Messages) > 0 {
+		i.Content = flattenEmbeddingMessages(raw.Messages)
+	} else {
+		i.Content = nil
+	}
+	return nil
 }
 
-// MarshalJSON emits the bare-array shape when the item carries no params, so the common
-// case round-trips to the same JSON it came in as - which keeps stored logs and semantic
-// cache keys stable.
+// MarshalJSON emits the bare-array shape when the item carries no params or messages,
+// so the common case round-trips to the same JSON it came in as - which keeps stored
+// logs and semantic cache keys stable.
 func (i EmbeddingInputItem) MarshalJSON() ([]byte, error) {
-	if i.Params == nil {
+	if i.Params == nil && len(i.Messages) == 0 {
 		return MarshalSorted(i.Content)
 	}
 	type alias EmbeddingInputItem
@@ -278,7 +314,7 @@ func (c EmbeddingContent) Validate() error {
 	return nil
 }
 
-// ValidateEmbeddingInput validates a []EmbeddingContent input slice.
+// ValidateEmbeddingInput validates a []EmbeddingInputItem input slice.
 func ValidateEmbeddingInput(input []EmbeddingInputItem) error {
 	if len(input) == 0 {
 		return fmt.Errorf("embedding input is empty")
@@ -286,6 +322,11 @@ func ValidateEmbeddingInput(input []EmbeddingInputItem) error {
 	for i, item := range input {
 		if err := item.Content.Validate(); err != nil {
 			return fmt.Errorf("input item %d: %w", i, err)
+		}
+		for j, msg := range item.Messages {
+			if err := msg.Content.Validate(); err != nil {
+				return fmt.Errorf("input item %d message %d: %w", i, j, err)
+			}
 		}
 	}
 	return nil

@@ -474,6 +474,9 @@ func CreateOpenAIRouteConfigs(pathPrefix string, handlerStore lib.HandlerStore) 
 					TextCompletionRequest: openaiReq.ToBifrostTextCompletionRequest(ctx),
 				}, nil
 			} else if openaiReq, ok := req.(*openai.OpenAIEmbeddingRequest); ok {
+				if !openaiReq.Input.IsEmpty() && !openaiReq.Messages.IsEmpty() {
+					return nil, errors.New("cannot specify both input and messages in embedding request")
+				}
 				return &schemas.BifrostRequest{
 					EmbeddingRequest: openaiReq.ToBifrostEmbeddingRequest(ctx),
 				}, nil
@@ -1049,6 +1052,9 @@ func CreateOpenAIRouteConfigs(pathPrefix string, handlerStore lib.HandlerStore) 
 			},
 			RequestConverter: func(ctx *schemas.BifrostContext, req interface{}) (*schemas.BifrostRequest, error) {
 				if embeddingReq, ok := req.(*openai.OpenAIEmbeddingRequest); ok {
+					if !embeddingReq.Input.IsEmpty() && !embeddingReq.Messages.IsEmpty() {
+						return nil, errors.New("cannot specify both input and messages in embedding request")
+					}
 					return &schemas.BifrostRequest{
 						EmbeddingRequest: embeddingReq.ToBifrostEmbeddingRequest(ctx),
 					}, nil

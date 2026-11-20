@@ -62,6 +62,11 @@ type OpenAIEmbeddingInput struct {
 	Texts      []string
 	Embedding  []int
 	Embeddings [][]int
+	Items      []schemas.EmbeddingInputItem
+}
+
+func (e *OpenAIEmbeddingInput) IsEmpty() bool {
+	return e == nil || (e.Text == nil && len(e.Texts) == 0 && len(e.Embedding) == 0 && len(e.Embeddings) == 0 && len(e.Items) == 0)
 }
 
 func (e *OpenAIEmbeddingInput) MarshalJSON() ([]byte, error) {
@@ -79,11 +84,14 @@ func (e *OpenAIEmbeddingInput) MarshalJSON() ([]byte, error) {
 	if e.Embeddings != nil {
 		set++
 	}
+	if len(e.Items) > 0 {
+		set++
+	}
 	if set == 0 {
 		return nil, fmt.Errorf("embedding input is empty")
 	}
 	if set > 1 {
-		return nil, fmt.Errorf("embedding input must set exactly one of: text, texts, embedding, embeddings")
+		return nil, fmt.Errorf("embedding input must set exactly one of: text, texts, embedding, embeddings, items")
 	}
 
 	if e.Text != nil {
@@ -98,6 +106,9 @@ func (e *OpenAIEmbeddingInput) MarshalJSON() ([]byte, error) {
 	if e.Embeddings != nil {
 		return providerUtils.MarshalSorted(e.Embeddings)
 	}
+	if len(e.Items) > 0 {
+		return providerUtils.MarshalSorted(e.Items)
+	}
 
 	return nil, fmt.Errorf("invalid embedding input")
 }
@@ -107,6 +118,7 @@ func (e *OpenAIEmbeddingInput) UnmarshalJSON(data []byte) error {
 	e.Texts = nil
 	e.Embedding = nil
 	e.Embeddings = nil
+	e.Items = nil
 	// Try string
 	var s string
 	if err := sonic.Unmarshal(data, &s); err == nil {
@@ -131,14 +143,19 @@ func (e *OpenAIEmbeddingInput) UnmarshalJSON(data []byte) error {
 		e.Embeddings = i2
 		return nil
 	}
-
-	return fmt.Errorf("unsupported embedding input shape")
+	items, err := schemas.UnmarshalEmbeddingMultimodalInput(data)
+	if err != nil {
+		return fmt.Errorf("unsupported embedding input shape: %w", err)
+	}
+	e.Items = items
+	return nil
 }
 
 // OpenAIEmbeddingRequest represents an OpenAI embedding request
 type OpenAIEmbeddingRequest struct {
-	Model string                `json:"model"`
-	Input *OpenAIEmbeddingInput `json:"input"` // Can be string or []string
+	Model    string                          `json:"model"`
+	Input    *OpenAIEmbeddingInput           `json:"input,omitempty"`    // Can be string, []string, tokens, or multimodal items
+	Messages *schemas.EmbeddingMessagesInput `json:"messages,omitempty"` // Multimodal conversation messages (e.g. Cloudflare EmbeddingGemma 2 / vLLM)
 
 	schemas.EmbeddingParameters
 

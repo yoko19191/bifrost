@@ -1028,3 +1028,18 @@ func TestOpenAISpeechRoutesCarryVertexGeminiTTS(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAIEmbeddingRouteRejectsBothInputAndMessages(t *testing.T) {
+	route := findOpenAIRoute("/openai", "/openai/v1/embeddings")
+	require.NotNil(t, route, "POST /openai/v1/embeddings not registered")
+
+	req := &openai.OpenAIEmbeddingRequest{}
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"model": "cloudflare/embeddinggemma-2",
+		"input": "hello",
+		"messages": [{"role": "user", "content": "world"}]
+	}`), req))
+	_, err := route.RequestConverter(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both input and messages")
+}

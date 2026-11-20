@@ -40,7 +40,12 @@ func (request *OpenAIEmbeddingRequest) ToBifrostEmbeddingRequest(ctx *schemas.Bi
 					{Type: schemas.EmbeddingContentPartTypeTokens, Tokens: t},
 				}}
 			}
+		case len(request.Input.Items) > 0:
+			embeddingInput = request.Input.Items
 		}
+	}
+	if len(embeddingInput) == 0 && request.Messages != nil {
+		embeddingInput = request.Messages.ToEmbeddingInput()
 	}
 
 	return &schemas.BifrostEmbeddingRequest{
